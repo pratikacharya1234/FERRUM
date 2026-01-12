@@ -1,0 +1,23 @@
+[package]
+name = "ferrum-core"
+description = "Core tensor primitives for FERRUM deep learning framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"

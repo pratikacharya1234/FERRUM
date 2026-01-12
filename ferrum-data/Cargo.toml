@@ -1,0 +1,17 @@
+[package]
+name = "ferrum-data"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Data loading utilities for FERRUM deep learning framework"
+keywords = ["deep-learning", "data-loading", "machine-learning", "dataset"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+ferrum-core = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+parking_lot = { workspace = true }

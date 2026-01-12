@@ -1,0 +1,1 @@
+parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, BatchSampler<Box<(dyn Sampler + 'static)>>>

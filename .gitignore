@@ -1,0 +1,30 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug files
+*.pdb
+
+# Test artifacts
+test_autograd_minimal
+test_autograd_minimal.rs
+test_backward_debug
+test_backward_debug.rs
+test_grad_accumulation
+test_grad_accumulation.rs
+
+# Temporary files
+*.tmp
+*.temp

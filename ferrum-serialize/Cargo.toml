@@ -1,0 +1,17 @@
+[package]
+name = "ferrum-serialize"
+description = "Model serialization for FERRUM deep learning framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrum-core.workspace = true
+serde.workspace = true
+bincode.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true

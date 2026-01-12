@@ -1,0 +1,43 @@
+[package]
+name = "ferrum-examples"
+description = "Example applications using FERRUM deep learning framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrum = { path = "../ferrum" }
+ferrum-autograd = { path = "../ferrum-autograd" }
+ferrum-optim = { path = "../ferrum-optim" }
+rand.workspace = true
+
+[[example]]
+name = "simple_autograd"
+path = "src/simple_autograd.rs"
+
+[[example]]
+name = "simple_nn"
+path = "src/simple_nn.rs"
+
+[[example]]
+name = "mnist"
+path = "src/mnist.rs"
+
+[[example]]
+name = "train_xor"
+path = "src/train_xor.rs"
+
+[[example]]
+name = "train_xor_autograd"
+path = "src/train_xor_autograd.rs"
+
+[[example]]
+name = "train_xor_simple"
+path = "src/train_xor_simple.rs"
+
+[[example]]
+name = "new_features_demo"
+path = "src/new_features_demo.rs"

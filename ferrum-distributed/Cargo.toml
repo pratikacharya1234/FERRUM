@@ -1,0 +1,22 @@
+[package]
+name = "ferrum-distributed"
+version.workspace = true
+edition.workspace = true
+description = "Distributed training support for Ferrum"
+repository.workspace = true
+license.workspace = true
+keywords = ["deep-learning", "distributed", "training", "gpu"]
+categories = ["science"]
+
+[dependencies]
+ferrum-core = { path = "../ferrum-core", version = "1.0.0" }
+thiserror = "1.0"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+rayon = "1.8"
+
+[features]
+default = []
+nccl = []  # NVIDIA Collective Communications Library
+gloo = []  # Facebook Gloo for CPU collective ops
+mpi = []   # MPI backend

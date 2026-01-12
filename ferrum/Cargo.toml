@@ -1,0 +1,33 @@
+[package]
+name = "ferrum"
+description = "FERRUM - Production-grade deep learning framework in pure Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["deep-learning", "machine-learning", "neural-network", "tensor", "ai"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+ferrum-core.workspace = true
+ferrum-autograd.workspace = true
+ferrum-ops.workspace = true
+ferrum-nn.workspace = true
+ferrum-optim.workspace = true
+ferrum-serialize.workspace = true
+ferrum-data = { path = "../ferrum-data", version = "1.0.0" }
+ferrum-distributed = { path = "../ferrum-distributed", version = "1.0.0" }
+
+[features]
+default = []
+# Enable CUDA support (requires CUDA toolkit)
+cuda = ["ferrum-cuda"]
+# Enable Metal support (macOS only)
+metal = []
+
+[dependencies.ferrum-cuda]
+path = "../ferrum-cuda"
+version = "1.0.0"
+optional = true

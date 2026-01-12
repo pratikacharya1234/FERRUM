@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="400" height="400" viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Gradient for metallic iron effect -->
+    <linearGradient id="ironGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4A4A4A;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#707070;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#3A3A3A;stop-opacity:1" />
+    </linearGradient>
+
+    <!-- Gradient for accent (burnt orange) -->
+    <linearGradient id="accentGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF6B35;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#D64420;stop-opacity:1" />
+    </linearGradient>
+
+    <!-- Silver highlight gradient -->
+    <radialGradient id="silverGlow">
+      <stop offset="0%" style="stop-color:#E8E8E8;stop-opacity:0.8" />
+      <stop offset="100%" style="stop-color:#B0B0B0;stop-opacity:0" />
+    </radialGradient>
+  </defs>
+
+  <!-- Background circle (dark graphite) -->
+  <circle cx="200" cy="200" r="190" fill="#2B2B2B" opacity="0.1"/>
+
+  <!-- Neural network lattice structure -->
+  <g id="lattice" stroke="url(#ironGradient)" stroke-width="3" fill="none" opacity="0.6">
+    <!-- Top layer (input) -->
+    <circle cx="200" cy="80" r="12"/>
+    <circle cx="140" cy="100" r="12"/>
+    <circle cx="260" cy="100" r="12"/>
+
+    <!-- Middle layer (hidden) -->
+    <circle cx="120" cy="160" r="14"/>
+    <circle cx="200" cy="170" r="14"/>
+    <circle cx="280" cy="160" r="14"/>
+    <circle cx="160" cy="200" r="14"/>
+    <circle cx="240" cy="200" r="14"/>
+
+    <!-- Bottom layer (output) -->
+    <circle cx="200" cy="260" r="12"/>
+    <circle cx="150" cy="280" r="12"/>
+    <circle cx="250" cy="280" r="12"/>
+  </g>
+
+  <!-- Connection lines (tensor flow) -->
+  <g id="connections" stroke="url(#accentGradient)" stroke-width="2" opacity="0.4">
+    <!-- Input to hidden -->
+    <line x1="200" y1="80" x2="120" y2="160"/>
+    <line x1="200" y1="80" x2="200" y2="170"/>
+    <line x1="200" y1="80" x2="280" y2="160"/>
+    <line x1="140" y1="100" x2="120" y2="160"/>
+    <line x1="140" y1="100" x2="160" y2="200"/>
+    <line x1="260" y1="100" x2="280" y2="160"/>
+    <line x1="260" y1="100" x2="240" y2="200"/>
+
+    <!-- Hidden to output -->
+    <line x1="120" y1="160" x2="200" y2="260"/>
+    <line x1="200" y1="170" x2="200" y2="260"/>
+    <line x1="280" y1="160" x2="200" y2="260"/>
+    <line x1="160" y1="200" x2="150" y2="280"/>
+    <line x1="240" y1="200" x2="250" y2="280"/>
+  </g>
+
+  <!-- Central atom symbol (Fe - iron) -->
+  <g id="fe-symbol" transform="translate(200, 200)">
+    <!-- Outer ring (orbital) -->
+    <circle cx="0" cy="0" r="60" stroke="url(#ironGradient)" stroke-width="4" fill="none" opacity="0.7"/>
+
+    <!-- Inner ring -->
+    <circle cx="0" cy="0" r="40" stroke="url(#ironGradient)" stroke-width="3" fill="none" opacity="0.5"/>
+
+    <!-- Central nucleus with Fe symbol -->
+    <circle cx="0" cy="0" r="28" fill="url(#ironGradient)"/>
+    <circle cx="0" cy="0" r="26" fill="#3A3A3A"/>
+
+    <!-- Fe text -->
+    <text x="0" y="0" font-family="'Courier New', monospace" font-size="20" font-weight="bold"
+          fill="url(#accentGradient)" text-anchor="middle" dominant-baseline="central">
+      Fe
+    </text>
+  </g>
+
+  <!-- Accent dots (electrons) -->
+  <g id="electrons" fill="url(#accentGradient)">
+    <circle cx="260" cy="200" r="5" opacity="0.9">
+      <animateTransform attributeName="transform" type="rotate" from="0 200 200" to="360 200 200"
+                        dur="8s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="200" cy="140" r="4" opacity="0.8">
+      <animateTransform attributeName="transform" type="rotate" from="0 200 200" to="360 200 200"
+                        dur="12s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="155" cy="180" r="4" opacity="0.7">
+      <animateTransform attributeName="transform" type="rotate" from="120 200 200" to="480 200 200"
+                        dur="10s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- Silver highlights for depth -->
+  <g id="highlights" opacity="0.3">
+    <circle cx="180" cy="180" r="15" fill="url(#silverGlow)"/>
+    <circle cx="240" cy="160" r="12" fill="url(#silverGlow)"/>
+  </g>
+
+  <!-- FERRUM text at bottom -->
+  <text x="200" y="350" font-family="'Arial', sans-serif" font-size="32" font-weight="bold"
+        fill="url(#ironGradient)" text-anchor="middle" letter-spacing="4">
+    FERRUM
+  </text>
+
+  <!-- Tagline -->
+  <text x="200" y="375" font-family="'Arial', sans-serif" font-size="11"
+        fill="#808080" text-anchor="middle" letter-spacing="2">
+    NATIVE DEEP LEARNING IN RUST
+  </text>
+</svg>

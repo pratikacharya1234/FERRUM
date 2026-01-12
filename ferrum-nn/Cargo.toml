@@ -1,0 +1,16 @@
+[package]
+name = "ferrum-nn"
+description = "Neural network layers for FERRUM deep learning framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrum-core.workspace = true
+ferrum-autograd.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+parking_lot = "0.12"

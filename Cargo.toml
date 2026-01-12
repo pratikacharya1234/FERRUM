@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "ferrum-core",
+    "ferrum-autograd",
+    "ferrum-ops",
+    "ferrum-nn",
+    "ferrum-optim",
+    "ferrum-serialize",
+    "ferrum-cuda",
+    "ferrum-data",
+    "ferrum-distributed",
+    "ferrum-examples",
+    "ferrum",  # Main facade crate
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/pratikacharya1234/FERRUM"
+authors = ["Pratik Acharya <pratikacharya1234@github.com>"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Internal crates
+ferrum-core = { path = "ferrum-core" }
+ferrum-autograd = { path = "ferrum-autograd" }
+ferrum-ops = { path = "ferrum-ops" }
+ferrum-nn = { path = "ferrum-nn" }
+ferrum-optim = { path = "ferrum-optim" }
+ferrum-serialize = { path = "ferrum-serialize" }
+ferrum-cuda = { path = "ferrum-cuda" }
+ferrum-data = { path = "ferrum-data" }
+
+# External dependencies
+thiserror = "1.0"
+num-traits = "0.2"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1.10"
+parking_lot = "0.12"
+once_cell = "1.19"
+smallvec = "1.13"
+half = { version = "2.4", features = ["num-traits", "rand_distr"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

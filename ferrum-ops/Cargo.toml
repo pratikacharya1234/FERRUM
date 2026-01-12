@@ -1,0 +1,29 @@
+[package]
+name = "ferrum-ops"
+description = "Optimized tensor operations for FERRUM deep learning framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrum-core.workspace = true
+rayon.workspace = true
+num-traits.workspace = true
+
+# Optional BLAS backend
+blas = { version = "0.22", optional = true }
+blas-src = { version = "0.10", optional = true, features = ["openblas"] }
+openblas-src = { version = "0.10", optional = true, features = ["cblas", "system"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+default = []
+# Enable SIMD optimizations (requires nightly)
+simd = []
+# Enable OpenBLAS for fast matrix operations
+openblas = ["blas", "blas-src", "openblas-src"]
