@@ -286,6 +286,11 @@ fn copy_device_to_device(src: *const u8, dst: *mut u8, size: usize) -> CudaResul
 }
 
 fn memset_device(ptr: *mut u8, value: u8, size: usize) -> CudaResult<()> {
+    // For all backends, a zero-size memset is a no-op and does not require a valid pointer.
+    if size == 0 {
+        return Ok(());
+    }
+
     #[cfg(feature = "cuda")]
     {
         // Real CUDA: cuMemsetD8
@@ -296,6 +301,11 @@ fn memset_device(ptr: *mut u8, value: u8, size: usize) -> CudaResult<()> {
     #[cfg(feature = "simulate")]
     {
         // Simulated: just memset
+        if ptr.is_null() {
+            return Err(CudaError::InvalidArgument {
+                message: "memset_device called with null pointer and non-zero size".to_string(),
+            });
+        }
         unsafe {
             std::ptr::write_bytes(ptr, value, size);
         }
