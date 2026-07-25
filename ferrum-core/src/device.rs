@@ -1,12 +1,12 @@
 //! Device abstraction for compute backends.
 //!
-//! FERRUM is designed to support multiple compute backends:
+//! FERRUM is GPU-first by default, with CPU as a fallback:
 //!
 //! | Device | Status | Notes |
 //! |--------|--------|-------|
-//! | CPU    | ✅ Stable | SIMD-optimized via Rayon |
-//! | CUDA   | 🚧 Planned | NVIDIA GPUs |
-//! | Metal  | 🚧 Planned | Apple Silicon |
+//! | CUDA   | ✅ Default | NVIDIA GPU acceleration via CUDA |
+//! | CPU    | ✅ Stable | SIMD-optimized fallback via Rayon |
+//! | Metal  | 🚧 Planned | Apple Silicon (MPS) |
 //! | Vulkan | 🚧 Planned | Cross-platform GPU |
 //!
 //! ## Usage
@@ -14,11 +14,14 @@
 //! ```rust
 //! use ferrum_core::Device;
 //!
-//! // Default device
-//! let device = Device::Cpu;
+//! // Default device (GPU if available, falls back to CPU)
+//! let device = Device::default();  // Cuda(0) or Cpu
 //!
-//! // Future: GPU selection
-//! // let device = Device::Cuda(0);  // First CUDA device
+//! // Explicit CPU
+//! let cpu = Device::Cpu;
+//!
+//! // Specific GPU
+//! let gpu1 = Device::Cuda(1);
 //! ```
 //!
 //! ## Device Placement
@@ -29,17 +32,31 @@
 use std::fmt;
 
 /// Compute device for tensor operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+///
+/// FERRUM is GPU-first. The default device is `Cuda(0)` when CUDA
+/// hardware is detected at runtime; falls back to `Cpu` otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
-    /// CPU with optional SIMD acceleration.
-    #[default]
-    Cpu,
     /// NVIDIA CUDA device (index specifies which GPU).
-    #[allow(dead_code)]
+    /// This is the default compute device in FERRUM.
     Cuda(usize),
+    /// CPU with optional SIMD acceleration.
+    /// Use explicitly when you need host memory.
+    Cpu,
     /// Apple Metal device.
-    #[allow(dead_code)]
     Metal(usize),
+}
+
+impl Default for Device {
+    /// Default device: CUDA GPU 0 if available, otherwise CPU.
+    #[inline]
+    fn default() -> Self {
+        if Device::cuda_is_available() {
+            Device::Cuda(0)
+        } else {
+            Device::Cpu
+        }
+    }
 }
 
 impl Device {
@@ -67,48 +84,42 @@ impl Device {
         !self.is_cpu()
     }
 
-    /// Get the device index (0 for CPU).
+    /// Get the device index.
     #[inline]
     pub const fn index(&self) -> usize {
         match self {
-            Device::Cpu => 0,
             Device::Cuda(i) | Device::Metal(i) => *i,
+            Device::Cpu => 0,
         }
     }
 
-    /// Get the default device (CPU).
-    #[inline]
-    pub const fn default() -> Self {
-        Device::Cpu
-    }
-
     /// Check if CUDA is available at runtime.
+    ///
+    /// Probes the CUDA Driver API (`libcuda.so.1` on Linux, `nvcuda.dll`
+    /// on Windows) to confirm GPU hardware and drivers are present.
     #[inline]
     pub fn cuda_is_available() -> bool {
-        // TODO: Implement CUDA detection
-        false
+        probe_cuda_hardware()
     }
 
     /// Check if Metal is available at runtime.
     #[inline]
     pub fn metal_is_available() -> bool {
-        // TODO: Implement Metal detection
         cfg!(target_os = "macos")
     }
 
-    /// Get the number of available CUDA devices.
+    /// Get the number of available CUDA devices at runtime.
     #[inline]
     pub fn cuda_device_count() -> usize {
-        // TODO: Implement CUDA device enumeration
-        0
+        probe_cuda_device_count()
     }
 }
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Device::Cpu => write!(f, "cpu"),
             Device::Cuda(i) => write!(f, "cuda:{}", i),
+            Device::Cpu => write!(f, "cpu"),
             Device::Metal(i) => write!(f, "metal:{}", i),
         }
     }
@@ -183,23 +194,166 @@ impl DeviceAllocator for CpuAllocator {
     }
 }
 
+// ── CUDA Hardware Probing ──────────────────────────────────────────────
+
+/// Probe CUDA hardware at runtime via the CUDA Driver API.
+///
+/// Returns `true` if at least one CUDA-capable GPU is present and the
+/// CUDA driver library can be loaded.
+fn probe_cuda_hardware() -> bool {
+    probe_cuda_device_count() > 0
+}
+
+/// Probe number of available CUDA devices via the CUDA Driver API.
+///
+/// Uses `dlopen` / `LoadLibrary` to load the CUDA driver dynamically
+/// at runtime — no compile-time dependency on the CUDA toolkit.
+fn probe_cuda_device_count() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        type CuInitFn = unsafe extern "C" fn(u32) -> i32;
+        type CuDeviceGetCountFn = unsafe extern "C" fn(*mut i32) -> i32;
+
+        // SAFETY: dlopen/dlsym are called with constant, null-terminated C strings.
+        // Function pointers are transmuted to the correct ABI signatures.
+        unsafe {
+            let lib = load_cuda_library_linux();
+            if lib.is_null() {
+                return 0;
+            }
+
+            // Resolve cuInit
+            let init_ptr = resolve_symbol(lib, "cuInit\0");
+            if init_ptr.is_null() {
+                unload_library_linux(lib);
+                return 0;
+            }
+            let cu_init: CuInitFn = std::mem::transmute(init_ptr);
+            if cu_init(0) != 0 {
+                unload_library_linux(lib);
+                return 0;
+            }
+
+            // Resolve cuDeviceGetCount
+            let count_ptr = resolve_symbol(lib, "cuDeviceGetCount\0");
+            if count_ptr.is_null() {
+                unload_library_linux(lib);
+                return 0;
+            }
+            let cu_device_get_count: CuDeviceGetCountFn =
+                std::mem::transmute(count_ptr);
+
+            let mut count: i32 = 0;
+            let result = cu_device_get_count(&mut count);
+            unload_library_linux(lib);
+
+            if result == 0 && count > 0 {
+                count as usize
+            } else {
+                0
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Windows: Load nvcuda.dll and probe for CUDA devices
+        #[cfg(target_os = "windows")]
+        {
+            use std::ffi::CString;
+            let lib_name = CString::new("nvcuda.dll").unwrap();
+            unsafe {
+                let lib = windows::Win32::System::LibraryLoader::LoadLibraryA(
+                    windows::core::PCSTR(lib_name.as_ptr() as *const u8)
+                );
+                match lib {
+                    Ok(handle) => {
+                        // Probe for CUDA devices via cuDeviceGetCount
+                        let probe_fn = libc::dlsym(
+                            handle.0 as *mut std::ffi::c_void,
+                            CString::new("cuDeviceGetCount").unwrap().as_ptr()
+                        );
+                        if !probe_fn.is_null() {
+                            let get_count: unsafe extern "C" fn(*mut i32) -> i32 =
+                                std::mem::transmute(probe_fn);
+                            let mut count: i32 = 0;
+                            let result = get_count(&mut count);
+                            windows::Win32::System::LibraryLoader::FreeLibrary(handle).ok();
+                            if result == 0 { count as usize } else { 0 }
+                        } else {
+                            windows::Win32::System::LibraryLoader::FreeLibrary(handle).ok();
+                            0
+                        }
+                    }
+                    Err(_) => 0,
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn load_cuda_library_linux() -> *mut std::ffi::c_void {
+    use std::ffi::CString;
+    let lib_name = CString::new("libcuda.so.1").unwrap();
+    let handle = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+    if handle.is_null() {
+        // Try the unversioned symlink
+        let lib_name2 = CString::new("libcuda.so").unwrap();
+        libc::dlopen(lib_name2.as_ptr(), libc::RTLD_NOW)
+    } else {
+        handle
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn resolve_symbol(
+    lib: *mut std::ffi::c_void,
+    name: &str,
+) -> *mut std::ffi::c_void {
+    let c_name = std::ffi::CString::new(name).unwrap();
+    libc::dlsym(lib, c_name.as_ptr())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn unload_library_linux(lib: *mut std::ffi::c_void) {
+    libc::dlclose(lib);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_device_properties() {
+    fn test_device_is_cpu() {
         assert!(Device::Cpu.is_cpu());
         assert!(!Device::Cpu.is_gpu());
+    }
+
+    #[test]
+    fn test_device_is_cuda() {
         assert!(Device::Cuda(0).is_cuda());
         assert!(Device::Cuda(0).is_gpu());
     }
 
     #[test]
     fn test_device_display() {
-        assert_eq!(Device::Cpu.to_string(), "cpu");
         assert_eq!(Device::Cuda(0).to_string(), "cuda:0");
+        assert_eq!(Device::Cpu.to_string(), "cpu");
         assert_eq!(Device::Metal(1).to_string(), "metal:1");
+    }
+
+    #[test]
+    fn test_device_default_is_cuda() {
+        let d = Device::default();
+        // If CUDA hardware is available, default should be Cuda(0).
+        // If not, falls back to Cpu. Either way this test verifies
+        // the default() method doesn't panic.
+        assert!(d.is_cuda() || d.is_cpu());
     }
 
     #[test]

@@ -50,10 +50,56 @@ pub fn kaiming_normal(shape: &[usize], fan_in: usize, dtype: DType, device: Devi
 ///
 /// Fills tensor with (semi) orthogonal matrix using QR decomposition.
 pub fn orthogonal(shape: &[usize], gain: f64, dtype: DType, device: Device) -> Tensor {
-    // Simplified: use normal init for now
-    // TODO: Implement proper orthogonal init with QR decomposition
-    let tensor = Tensor::randn(shape.to_vec(), dtype, device);
-    tensor.mul_scalar(gain).unwrap()
+    if shape.len() < 2 {
+        return Tensor::randn(shape.to_vec(), dtype, device).mul_scalar(gain).unwrap();
+    }
+    
+    let rows = shape[0];
+    let cols: usize = shape[1..].iter().product();
+    let flat_shape = [rows, cols];
+    
+    // Generate random normal matrix
+    let mat = Tensor::randn(flat_shape, dtype, device);
+    let mat_data = mat.to_vec::<f32>().unwrap();
+    
+    // Simple QR via Gram-Schmidt (sufficient for init)
+    let mut q = vec![0.0f32; rows * cols];
+    
+    for j in 0..cols {
+        // Copy column j
+        for i in 0..rows {
+            q[i * cols + j] = mat_data[i * cols + j];
+        }
+        // Subtract projections
+        for k in 0..j {
+            let mut dot = 0.0f32;
+            for i in 0..rows {
+                dot += q[i * cols + k] * q[i * cols + j];
+            }
+            for i in 0..rows {
+                q[i * cols + j] -= dot * q[i * cols + k];
+            }
+        }
+        // Normalize
+        let mut norm = 0.0f32;
+        for i in 0..rows {
+            norm += q[i * cols + j] * q[i * cols + j];
+        }
+        norm = norm.sqrt().max(1e-8);
+        for i in 0..rows {
+            q[i * cols + j] /= norm;
+        }
+    }
+    
+    // Reshape to original shape
+    let q_tensor = Tensor::from_slice(&q, flat_shape, device).unwrap();
+    let mut result = q_tensor;
+    if shape.len() > 2 {
+        let mut full_shape = vec![rows];
+        full_shape.extend_from_slice(&shape[1..]);
+        result = result.reshape(full_shape).unwrap();
+    }
+    result.mul_scalar(gain).unwrap()
 }
 
 /// Constant initialization.

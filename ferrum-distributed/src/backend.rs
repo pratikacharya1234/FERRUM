@@ -24,7 +24,7 @@ impl Backend {
                 false
             }
             Backend::Gloo => {
-                // Gloo is always available as our default simulated backend
+                // Gloo is always available as our default TCP-based backend
                 true
             }
             Backend::Mpi => {

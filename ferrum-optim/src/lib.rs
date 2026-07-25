@@ -17,6 +17,7 @@
 pub mod adam;
 pub mod amp;
 pub mod optimizer;
+pub mod quantize;
 pub mod scheduler;
 pub mod sgd;
 
@@ -24,6 +25,10 @@ pub mod prelude {
     pub use crate::adam::{Adam, AdamConfig};
     pub use crate::amp::{GradScaler, Autocast, to_half, to_bfloat16, to_float, has_inf_or_nan};
     pub use crate::optimizer::Optimizer;
+    pub use crate::quantize::{
+        CalibrationStats, QuantizedLinear, QuantizedConv2d,
+        quantize_tensor, dequantize_tensor, quantize_weight, calibrate,
+    };
     pub use crate::scheduler::{
         LRScheduler, StepLR, MultiStepLR, ExponentialLR, 
         CosineAnnealingLR, CosineAnnealingWarmRestarts,

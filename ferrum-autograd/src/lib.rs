@@ -46,6 +46,7 @@ pub mod backward;
 pub mod function;
 pub mod gradcheck;
 pub mod graph;
+pub mod memory;
 pub mod tape;
 
 pub mod prelude {
@@ -54,6 +55,7 @@ pub mod prelude {
     pub use crate::function::Function;
     pub use crate::gradcheck::{check_gradients, quick_gradcheck};
     pub use crate::graph::{ComputationGraph, Node, NodeId};
+    pub use crate::memory::{Arena, MemoryPlan, MemoryPlanner};
     pub use crate::tape::GradientTape;
 }
 

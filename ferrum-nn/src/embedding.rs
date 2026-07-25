@@ -83,9 +83,16 @@ impl Embedding {
     pub fn with_padding_idx(mut self, padding_idx: usize) -> Self {
         self.padding_idx = Some(padding_idx);
         
-        // Zero out the padding embedding
-        // In a full implementation, we'd modify the weight directly
-        // For now, we'll handle this in forward pass
+        // Zero out the padding embedding row
+        let mut weight_data = self.weight.to_vec::<f32>().unwrap();
+        let start = padding_idx * self.embedding_dim;
+        let end = start + self.embedding_dim;
+        if end <= weight_data.len() {
+            for i in start..end {
+                weight_data[i] = 0.0;
+            }
+            self.weight = Tensor::from_slice(&weight_data, self.weight.shape().to_vec(), self.weight.device()).unwrap();
+        }
         
         self
     }

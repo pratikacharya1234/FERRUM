@@ -16,7 +16,7 @@ pub fn main() -> Result<()> {
     println!("Example 1: f(x) = x^2");
     println!("─────────────────────────────────────────────────");
 
-    GradientTape::with_tape(|_tape| {
+    GradientTape::with_tape(|_tape| -> Result<()> {
         let x = Tensor::from_slice(&[3.0f32], [1], Device::Cpu)?
             .with_requires_grad(true);
 
@@ -42,7 +42,7 @@ pub fn main() -> Result<()> {
     println!("Example 2: f(x, y) = x * y + x");
     println!("─────────────────────────────────────────────────");
 
-    GradientTape::with_tape(|_tape| {
+    GradientTape::with_tape(|_tape| -> Result<()> {
         let x = Tensor::from_slice(&[2.0f32], [1], Device::Cpu)?
             .with_requires_grad(true);
         let y = Tensor::from_slice(&[3.0f32], [1], Device::Cpu)?

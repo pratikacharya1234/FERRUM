@@ -148,14 +148,12 @@ mod private {
     pub trait Sealed {}
     impl Sealed for f32 {}
     impl Sealed for f64 {}
-    // f16/bf16 disabled for now
-    // impl Sealed for half::f16 {}
-    // impl Sealed for half::bf16 {}
+    impl Sealed for half::f16 {}
+    impl Sealed for half::bf16 {}
     impl Sealed for i32 {}
     impl Sealed for i64 {}
     impl Sealed for u8 {}
-    // bool disabled for now
-    // impl Sealed for bool {}
+    impl Sealed for bool {}
 }
 
 impl Element for f32 {
@@ -206,9 +204,8 @@ impl Element for f64 {
     }
 }
 
-// Note: f16/bf16 Element implementations are disabled until bytemuck support is added
-// They require the `bytemuck` feature in the `half` crate
-/*
+// Note: f16/bf16 Element implementations require bytemuck support
+// They are now enabled with the bytemuck feature in the half crate
 impl Element for f16 {
     const DTYPE: DType = DType::F16;
 
@@ -256,7 +253,6 @@ impl Element for bf16 {
         bf16::ONE
     }
 }
-*/
 
 impl Element for i32 {
     const DTYPE: DType = DType::I32;
@@ -331,13 +327,12 @@ impl Element for u8 {
 }
 
 // Note: bool doesn't implement Pod, so we use a wrapper type internally
-// For now, bool Element is disabled
-/*
+// The BoolWrapper provides a Pod-safe representation of bool
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(transparent)]
 struct BoolWrapper(u8);
-unsafe impl Zeroable for BoolWrapper {}
-unsafe impl Pod for BoolWrapper {}
+unsafe impl bytemuck::Zeroable for BoolWrapper {}
+unsafe impl bytemuck::Pod for BoolWrapper {}
 
 impl Element for bool {
     const DTYPE: DType = DType::Bool;
@@ -362,7 +357,6 @@ impl Element for bool {
         true
     }
 }
-*/
 
 /// Trait for floating point element types (supports autograd).
 pub trait FloatElement: Element + num_traits::Float {

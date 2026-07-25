@@ -69,14 +69,18 @@ pub fn main() -> Result<()> {
     println!("─────────────────────────────────────────────────────────────");
 
     for epoch in 1..=num_epochs {
-        GradientTape::with_tape(|_tape| {
+        GradientTape::with_tape(|_tape| -> Result<()> {
             // Zero gradients
             optimizer.zero_grad();
 
-            // Forward pass
-            let z1 = x.matmul(&w1)?.add(&b1.unsqueeze(0)?.expand([4, 4])?)?;
+            // Forward pass. Bias is added via implicit broadcasting: the
+            // autograd AddBackward reduces the gradient back to the bias
+            // shape. (Do NOT pre-expand the bias with unsqueeze+expand —
+            // expand is not tracked by autograd and produces a gradient
+            // with the expanded shape instead of the bias shape.)
+            let z1 = x.matmul(&w1)?.add(&b1)?;
             let a1 = z1.tanh()?;
-            let z2 = a1.matmul(&w2)?.add(&b2.unsqueeze(0)?.expand([4, 1])?)?;
+            let z2 = a1.matmul(&w2)?.add(&b2)?;
             let a2 = z2.sigmoid()?;
 
             // Compute MSE loss
@@ -110,9 +114,9 @@ pub fn main() -> Result<()> {
 
     // Evaluate final predictions
     println!("Final predictions:");
-    let z1 = x.matmul(&w1)?.add(&b1.unsqueeze(0)?.expand([4, 4])?)?;
+    let z1 = x.matmul(&w1)?.add(&b1)?;
     let a1 = z1.tanh()?;
-    let z2 = a1.matmul(&w2)?.add(&b2.unsqueeze(0)?.expand([4, 1])?)?;
+    let z2 = a1.matmul(&w2)?.add(&b2)?;
     let final_output = z2.sigmoid()?;
     let predictions = final_output.to_vec::<f32>()?;
 

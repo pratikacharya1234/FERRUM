@@ -1,62 +1,135 @@
-//! CUDA memory management.
+//! CUDA GPU memory management via the CUDA Driver API.
+//!
+//! All GPU memory allocation (`cuMemAlloc`, `cuMemFree`) and data
+//! transfer (`cuMemcpyHtoD`, `cuMemcpyDtoH`, `cuMemcpyDtoD`) is
+//! performed through the dynamically-loaded Driver API.
 
-use std::sync::Arc;
+use std::ffi::c_void;
+use std::sync::{Arc, OnceLock};
+
 use parking_lot::Mutex;
 
 use crate::cuda_device::CudaDevice;
 use crate::error::{CudaError, CudaResult};
 
-/// A buffer of GPU memory.
+// ── CUDA Driver API Memory Function Types ─────────────────────────────
+
+type CuMemAllocFn = unsafe extern "C" fn(*mut u64, usize) -> i32;
+type CuMemFreeFn = unsafe extern "C" fn(u64) -> i32;
+type CuMemcpyHtoDFn = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+type CuMemcpyDtoHFn = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+type CuMemcpyDtoDFn = unsafe extern "C" fn(u64, u64, usize) -> i32;
+type CuMemsetD8Fn = unsafe extern "C" fn(u64, u8, usize) -> i32;
+
+struct MemFns {
+    alloc: CuMemAllocFn,
+    free: CuMemFreeFn,
+    hto_d: CuMemcpyHtoDFn,
+    dto_h: CuMemcpyDtoHFn,
+    dto_d: CuMemcpyDtoDFn,
+    memset: CuMemsetD8Fn,
+}
+
+static MEM_FNS: OnceLock<MemFns> = OnceLock::new();
+
+fn get_mem_fns() -> CudaResult<&'static MemFns> {
+    if let Some(fns) = MEM_FNS.get() {
+        return Ok(fns);
+    }
+
+    let fns = unsafe {
+        let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+        let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+        if lib.is_null() {
+            return Err(CudaError::NotAvailable);
+        }
+
+        macro_rules! res {
+            ($name:expr, $t:ty) => {{
+                let c = std::ffi::CString::new($name).unwrap();
+                let p = libc::dlsym(lib, c.as_ptr());
+                if p.is_null() {
+                    return Err(CudaError::NotAvailable);
+                }
+                std::mem::transmute(p)
+            }};
+        }
+
+        MemFns {
+            alloc: res!("cuMemAlloc_v2", CuMemAllocFn),
+            free: res!("cuMemFree_v2", CuMemFreeFn),
+            hto_d: res!("cuMemcpyHtoD_v2", CuMemcpyHtoDFn),
+            dto_h: res!("cuMemcpyDtoH_v2", CuMemcpyDtoHFn),
+            dto_d: res!("cuMemcpyDtoD_v2", CuMemcpyDtoDFn),
+            memset: res!("cuMemsetD8_v2", CuMemsetD8Fn),
+        }
+    };
+
+    let _ = MEM_FNS.set(fns);
+    Ok(MEM_FNS.get().unwrap())
+}
+
+// ── CudaBuffer ────────────────────────────────────────────────────────
+
+/// A buffer of GPU memory allocated via `cuMemAlloc`.
 #[derive(Debug)]
 pub struct CudaBuffer {
-    /// Device pointer (or simulated CPU pointer).
-    ptr: *mut u8,
+    /// CUDA device pointer (u64 handle used by Driver API).
+    ptr: u64,
     /// Size in bytes.
     size: usize,
     /// Device this buffer belongs to.
     device: Arc<CudaDevice>,
-    /// Whether this buffer owns its memory.
+    /// Whether this buffer owns its memory (will call cuMemFree on drop).
     owned: bool,
 }
 
-// SAFETY: CudaBuffer is Send + Sync because GPU memory operations
-// are synchronized through CUDA streams.
+// SAFETY: GPU memory pointers are valid across threads when
+// synchronization is handled through CUDA streams.
 unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
 
 impl CudaBuffer {
-    /// Allocate a new GPU buffer.
+    /// Allocate a new GPU buffer via `cuMemAlloc`.
     pub fn new(device: Arc<CudaDevice>, size: usize) -> CudaResult<Self> {
         if size == 0 {
             return Ok(Self {
-                ptr: std::ptr::null_mut(),
+                ptr: 0,
                 size: 0,
                 device,
                 owned: true,
             });
         }
 
-        // Check available memory
-        if size > device.free_memory() {
+        // Ensure CUDA is initialized and context is current
+        device.set_current()?;
+
+        let fns = get_mem_fns()?;
+        let mut dptr: u64 = 0;
+        let result = unsafe { (fns.alloc)(&mut dptr, size) };
+
+        if result != 0 || dptr == 0 {
             return Err(CudaError::OutOfMemory {
                 requested: size,
                 available: device.free_memory(),
             });
         }
 
-        let ptr = alloc_device_memory(size)?;
         device.track_alloc(size);
 
         Ok(Self {
-            ptr,
+            ptr: dptr,
             size,
             device,
             owned: true,
         })
     }
 
-    /// Create a buffer from existing device pointer (does not take ownership).
-    pub unsafe fn from_ptr(device: Arc<CudaDevice>, ptr: *mut u8, size: usize) -> Self {
+    /// Create a buffer from an existing device pointer (does not take ownership).
+    ///
+    /// # Safety
+    /// `ptr` must be a valid CUDA device pointer allocated via `cuMemAlloc`.
+    pub unsafe fn from_ptr(device: Arc<CudaDevice>, ptr: u64, size: usize) -> Self {
         Self {
             ptr,
             size,
@@ -65,8 +138,8 @@ impl CudaBuffer {
         }
     }
 
-    /// Get the device pointer.
-    pub fn ptr(&self) -> *mut u8 {
+    /// Get the raw CUDA device pointer.
+    pub fn ptr(&self) -> u64 {
         self.ptr
     }
 
@@ -75,12 +148,12 @@ impl CudaBuffer {
         self.size
     }
 
-    /// Get the device.
+    /// Get the device this buffer is allocated on.
     pub fn device(&self) -> &Arc<CudaDevice> {
         &self.device
     }
 
-    /// Copy data from host to device.
+    /// Copy data from host memory to GPU (H2D transfer via `cuMemcpyHtoD`).
     pub fn copy_from_host(&mut self, data: &[u8]) -> CudaResult<()> {
         if data.len() > self.size {
             return Err(CudaError::InvalidArgument {
@@ -92,11 +165,22 @@ impl CudaBuffer {
             });
         }
 
-        copy_host_to_device(data.as_ptr(), self.ptr, data.len())?;
+        self.device.set_current()?;
+
+        let fns = get_mem_fns()?;
+        let result = unsafe {
+            (fns.hto_d)(self.ptr, data.as_ptr() as *const c_void, data.len())
+        };
+
+        if result != 0 {
+            return Err(CudaError::DriverError {
+                message: format!("cuMemcpyHtoD failed with code {result}"),
+            });
+        }
         Ok(())
     }
 
-    /// Copy data from device to host.
+    /// Copy data from GPU to host memory (D2H transfer via `cuMemcpyDtoH`).
     pub fn copy_to_host(&self, data: &mut [u8]) -> CudaResult<()> {
         if data.len() > self.size {
             return Err(CudaError::InvalidArgument {
@@ -108,37 +192,77 @@ impl CudaBuffer {
             });
         }
 
-        copy_device_to_host(self.ptr, data.as_mut_ptr(), data.len())?;
+        self.device.set_current()?;
+
+        let fns = get_mem_fns()?;
+        let result = unsafe {
+            (fns.dto_h)(data.as_mut_ptr() as *mut c_void, self.ptr, data.len())
+        };
+
+        if result != 0 {
+            return Err(CudaError::DriverError {
+                message: format!("cuMemcpyDtoH failed with code {result}"),
+            });
+        }
         Ok(())
     }
 
-    /// Copy data from another device buffer.
+    /// Copy data from another GPU buffer (D2D transfer via `cuMemcpyDtoD`).
     pub fn copy_from_device(&mut self, src: &CudaBuffer) -> CudaResult<()> {
         if src.size > self.size {
             return Err(CudaError::InvalidArgument {
                 message: format!(
                     "Source size {} exceeds destination size {}",
-                    src.size, self.size
+                    src.size,
+                    self.size
                 ),
             });
         }
 
-        copy_device_to_device(src.ptr, self.ptr, src.size)?;
+        self.device.set_current()?;
+
+        let fns = get_mem_fns()?;
+        let result = unsafe { (fns.dto_d)(self.ptr, src.ptr, src.size) };
+
+        if result != 0 {
+            return Err(CudaError::DriverError {
+                message: format!("cuMemcpyDtoD failed with code {result}"),
+            });
+        }
         Ok(())
     }
 
-    /// Set all bytes to zero.
+    /// Set all bytes in the buffer to zero on the GPU (via `cuMemsetD8`).
     pub fn zero(&mut self) -> CudaResult<()> {
-        memset_device(self.ptr, 0, self.size)?;
+        if self.size == 0 {
+            return Ok(());
+        }
+
+        self.device.set_current()?;
+
+        let fns = get_mem_fns()?;
+        let result = unsafe { (fns.memset)(self.ptr, 0, self.size) };
+
+        if result != 0 {
+            return Err(CudaError::DriverError {
+                message: format!("cuMemsetD8 failed with code {result}"),
+            });
+        }
         Ok(())
     }
 }
 
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
-        if self.owned && !self.ptr.is_null() {
-            let _ = free_device_memory(self.ptr);
-            self.device.track_free(self.size);
+        if self.owned && self.ptr != 0 {
+            if self.device.set_current().is_ok() {
+                if let Ok(fns) = get_mem_fns() {
+                    let result = unsafe { (fns.free)(self.ptr) };
+                    if result == 0 {
+                        self.device.track_free(self.size);
+                    }
+                }
+            }
         }
     }
 }
@@ -147,183 +271,19 @@ impl Clone for CudaBuffer {
     fn clone(&self) -> Self {
         let mut new_buffer = CudaBuffer::new(self.device.clone(), self.size)
             .expect("Failed to allocate GPU memory for clone");
-        new_buffer.copy_from_device(self)
+        new_buffer
+            .copy_from_device(self)
             .expect("Failed to copy GPU memory");
         new_buffer
     }
 }
 
-// ============================================================================
-// Memory allocation functions (simulated or real CUDA)
-// ============================================================================
-
-fn alloc_device_memory(size: usize) -> CudaResult<*mut u8> {
-    #[cfg(feature = "cuda")]
-    {
-        // Real CUDA: cuMemAlloc
-        let _ = size;
-        todo!("Real CUDA allocation")
-    }
-
-    #[cfg(feature = "simulate")]
-    {
-        // Simulated: use aligned CPU memory
-        let layout = std::alloc::Layout::from_size_align(size, 256)
-            .map_err(|_| CudaError::InvalidArgument {
-                message: "Invalid allocation size".to_string(),
-            })?;
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            return Err(CudaError::OutOfMemory {
-                requested: size,
-                available: 0,
-            });
-        }
-        Ok(ptr)
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "simulate")))]
-    {
-        let _ = size;
-        Err(CudaError::NotAvailable)
-    }
-}
-
-fn free_device_memory(ptr: *mut u8) -> CudaResult<()> {
-    #[cfg(feature = "cuda")]
-    {
-        // Real CUDA: cuMemFree
-        let _ = ptr;
-        todo!("Real CUDA free")
-    }
-
-    #[cfg(feature = "simulate")]
-    {
-        // Simulated: we can't easily free without knowing the size
-        // In a real implementation, we'd track this
-        // For now, leak (not ideal but safe for testing)
-        let _ = ptr;
-        Ok(())
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "simulate")))]
-    {
-        let _ = ptr;
-        Err(CudaError::NotAvailable)
-    }
-}
-
-fn copy_host_to_device(src: *const u8, dst: *mut u8, size: usize) -> CudaResult<()> {
-    #[cfg(feature = "cuda")]
-    {
-        // Real CUDA: cuMemcpyHtoD
-        let _ = (src, dst, size);
-        todo!("Real CUDA H2D copy")
-    }
-
-    #[cfg(feature = "simulate")]
-    {
-        // Simulated: just memcpy
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, size);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "simulate")))]
-    {
-        let _ = (src, dst, size);
-        Err(CudaError::NotAvailable)
-    }
-}
-
-fn copy_device_to_host(src: *const u8, dst: *mut u8, size: usize) -> CudaResult<()> {
-    #[cfg(feature = "cuda")]
-    {
-        // Real CUDA: cuMemcpyDtoH
-        let _ = (src, dst, size);
-        todo!("Real CUDA D2H copy")
-    }
-
-    #[cfg(feature = "simulate")]
-    {
-        // Simulated: just memcpy
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, size);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "simulate")))]
-    {
-        let _ = (src, dst, size);
-        Err(CudaError::NotAvailable)
-    }
-}
-
-fn copy_device_to_device(src: *const u8, dst: *mut u8, size: usize) -> CudaResult<()> {
-    #[cfg(feature = "cuda")]
-    {
-        // Real CUDA: cuMemcpyDtoD
-        let _ = (src, dst, size);
-        todo!("Real CUDA D2D copy")
-    }
-
-    #[cfg(feature = "simulate")]
-    {
-        // Simulated: just memcpy
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, size);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "simulate")))]
-    {
-        let _ = (src, dst, size);
-        Err(CudaError::NotAvailable)
-    }
-}
-
-fn memset_device(ptr: *mut u8, value: u8, size: usize) -> CudaResult<()> {
-    // For all backends, a zero-size memset is a no-op and does not require a valid pointer.
-    if size == 0 {
-        return Ok(());
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        // Real CUDA: cuMemsetD8
-        let _ = (ptr, value, size);
-        todo!("Real CUDA memset")
-    }
-
-    #[cfg(feature = "simulate")]
-    {
-        // Simulated: just memset
-        if ptr.is_null() {
-            return Err(CudaError::InvalidArgument {
-                message: "memset_device called with null pointer and non-zero size".to_string(),
-            });
-        }
-        unsafe {
-            std::ptr::write_bytes(ptr, value, size);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "simulate")))]
-    {
-        let _ = (ptr, value, size);
-        Err(CudaError::NotAvailable)
-    }
-}
-
-// ============================================================================
-// Memory pool for efficient allocation
-// ============================================================================
+// ── Memory Pool ───────────────────────────────────────────────────────
 
 /// A memory pool for efficient GPU memory allocation.
+///
+/// Reuses previously freed buffers to reduce `cuMemAlloc`/`cuMemFree`
+/// overhead. Buffers are organized by rounded-up bucket sizes.
 pub struct MemoryPool {
     device: Arc<CudaDevice>,
     /// Free blocks organized by size (power of 2).
@@ -335,7 +295,7 @@ pub struct MemoryPool {
 }
 
 impl MemoryPool {
-    /// Create a new memory pool.
+    /// Create a new memory pool for the given device.
     pub fn new(device: Arc<CudaDevice>) -> Self {
         let num_buckets = 21; // 256 bytes to 256 MB
         Self {
@@ -346,7 +306,7 @@ impl MemoryPool {
         }
     }
 
-    /// Allocate a buffer from the pool.
+    /// Allocate a buffer from the pool, reusing a cached one if available.
     pub fn alloc(&self, size: usize) -> CudaResult<CudaBuffer> {
         let size = self.round_size(size);
         let bucket = self.size_to_bucket(size);
@@ -359,20 +319,20 @@ impl MemoryPool {
             }
         }
 
-        // Allocate new
+        // Allocate new from GPU
         CudaBuffer::new(self.device.clone(), size)
     }
 
-    /// Return a buffer to the pool.
+    /// Return a buffer to the pool for future reuse.
     pub fn free(&self, buffer: CudaBuffer) {
         let bucket = self.size_to_bucket(buffer.size());
         if bucket < self.free_blocks.lock().len() {
             self.free_blocks.lock()[bucket].push(buffer);
         }
-        // If too large, just drop it
+        // If too large, just drop it (will call cuMemFree)
     }
 
-    /// Clear all cached memory.
+    /// Clear all cached memory, freeing GPU allocations.
     pub fn clear(&self) {
         let mut free_blocks = self.free_blocks.lock();
         for bucket in free_blocks.iter_mut() {
@@ -386,36 +346,46 @@ impl MemoryPool {
     }
 
     fn size_to_bucket(&self, size: usize) -> usize {
-        let min_bits = self.min_block_size.trailing_zeros() as usize;
-        let size_bits = size.trailing_zeros() as usize;
+        let min_bits = self.min_block_size.ilog2() as usize;
+        let size_bits = size.ilog2() as usize;
         size_bits.saturating_sub(min_bits)
     }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cuda_device::init_cuda;
 
     #[test]
-    #[cfg(feature = "simulate")]
-    fn test_buffer_allocation() {
-        let device = Arc::new(CudaDevice::new(0).unwrap());
-        let buffer = CudaBuffer::new(device, 1024).unwrap();
-        assert_eq!(buffer.size(), 1024);
+    fn test_buffer_allocation_when_gpu_available() {
+        // This test only runs when a GPU is present
+        if init_cuda().is_ok() {
+            if let Ok(device) = CudaDevice::new(0) {
+                let device = Arc::new(device);
+                let buffer = CudaBuffer::new(device, 1024).unwrap();
+                assert_eq!(buffer.size(), 1024);
+            }
+        }
     }
 
     #[test]
-    #[cfg(feature = "simulate")]
-    fn test_host_device_copy() {
-        let device = Arc::new(CudaDevice::new(0).unwrap());
-        let mut buffer = CudaBuffer::new(device, 1024).unwrap();
-        
-        let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
-        buffer.copy_from_host(&data).unwrap();
-        
-        let mut result = vec![0u8; 1024];
-        buffer.copy_to_host(&mut result).unwrap();
-        
-        assert_eq!(data, result);
+    fn test_host_device_copy_when_gpu_available() {
+        if init_cuda().is_ok() {
+            if let Ok(device) = CudaDevice::new(0) {
+                let device = Arc::new(device);
+                let mut buffer = CudaBuffer::new(device, 1024).unwrap();
+
+                let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+                buffer.copy_from_host(&data).unwrap();
+
+                let mut result = vec![0u8; 1024];
+                buffer.copy_to_host(&mut result).unwrap();
+
+                assert_eq!(data, result);
+            }
+        }
     }
 }

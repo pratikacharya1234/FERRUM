@@ -5,282 +5,213 @@
 <h1 align="center">FERRUM</h1>
 
 <p align="center">
-  <strong>Production-Grade Deep Learning Framework in Pure Rust</strong>
+  <strong>A deep learning framework in pure Rust, with runtime-loaded CUDA</strong>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust"></a>
-  <a href="https://github.com/pratikacharya1234/FERRUM/releases"><img src="https://img.shields.io/badge/version-1.0.0-green.svg" alt="Version"></a>
-  <img src="https://img.shields.io/badge/tests-154%20passing-brightgreen.svg" alt="Tests">
-</p>
-
-<p align="center">
-  <em>Zero Python. Zero GIL. Zero Overhead.</em>
+  <img src="https://img.shields.io/badge/tests-217%20passing-brightgreen.svg" alt="Tests">
 </p>
 
 ---
 
-## What is FERRUM?
+FERRUM is an **experimental** deep learning framework written entirely in Rust:
 
-FERRUM (Latin for "iron", Fe) is a fully functional deep learning framework written entirely in Rust. It provides a PyTorch-like API for building and training neural networks.
+1. **A training stack** — tensors, tape-based autograd, `ferrum-nn` layers,
+   SGD/Adam — that trains real models end to end (XOR at 100% accuracy;
+   CIFAR-10 MLP on real data: test accuracy 39.8% after 3 epochs on a
+   5000-image subset, vs 10% random baseline).
+2. **A CUDA compute layer** — the CUDA Driver API, cuBLAS, and NVRTC loaded
+   at runtime via `dlopen`, no CUDA toolkit needed at compile time — benchmarked
+   on an A100 at 144+ TFLOPS TF32 and ~270 TFLOPS FP16.
 
-### Working Features
+**As of 2026-07-25, end-to-end GPU training is verified on an A100:**
+`Tensor` ops on `Device::Cuda` dispatch to cuBLAS/NVRTC kernels (41/41 on
+the `examples/gpu_smoke.rs` correctness gate, including autograd gradient
+parity with CPU), and **CIFAR-10 trains on GPU with a loss curve numerically
+equivalent to CPU at ~165× the speed (0.2 s/epoch vs 33 s)**. F32 only for
+now; anything unimplemented on GPU errors loudly instead of silently falling
+back to CPU. See [Known Limitations](#known-limitations).
 
-| Feature | Status | Verified |
-|---------|--------|----------|
-| N-dimensional tensors | Complete | Yes |
-| Automatic differentiation | Complete | Yes |
-| Neural networks (Linear, ReLU, etc.) | Complete | Yes |
-| Backpropagation training | Complete | XOR 100% accuracy |
-| SGD and Adam optimizers | Complete | Yes |
-| Learning rate schedulers | Complete | 8 schedulers |
-| Embedding layer (NLP) | Complete | Yes |
-| PyTorch-style DataLoader | Complete | Yes |
-| Save/load models | Complete | Yes |
-| Unit tests | 154 passing | Yes |
+---
 
-### Current Limitations
+## Verified Performance (NVIDIA A100-SXM4-40GB)
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Real CUDA GPU | Simulated | Kernel stubs, no actual CUDA |
-| Conv2d layers | Planned | v1.1 |
-| LSTM/GRU layers | Planned | v1.1 |
-| Transformers | Planned | v1.2 |
-| BLAS optimization | Not yet | Uses naive matmul |
-| Distributed training | Simulated | Infrastructure exists |
+Measured with `cargo run --release --example bench` on Google Colab
+(CUDA 12). These exercise the raw `ferrum-cuda` layer directly — **not** the
+`Tensor` API.
 
-### Best Use Cases
+| Benchmark | FERRUM | PyTorch reference (same GPU) | Verdict |
+|---|---|---|---|
+| Matmul TF32, 4096³ | **144–162 TFLOPS** | ~156 TFLOPS | Match |
+| Matmul FP16, 4096³ | **272 TFLOPS** | ~312 TFLOPS | −13% |
+| Fused element-wise chain, 1M elems | **~30 µs** | ~30 µs | Match |
+| Alloc + fill bandwidth, 256 MB | **~2850 GB/s** | ~2000 GB/s | Faster |
 
-- Learning Rust + ML
-- Small neural networks (MLPs, classifiers)
-- Research prototypes
-- Embedded/Edge ML (no Python dependency)
+Why the FP16 gap: FERRUM calls `cublasGemmEx`, which tops out around
+270–290 TFLOPS for this shape. PyTorch reaches ~312 through `cublasLt` with
+workspace allocation and heuristic algorithm search. Closing this requires
+implementing the `cublasLt` path (roadmap), not tuning constants — we measured
+the alternatives (`CUBLAS_GEMM_DEFAULT` drops to ~230).
+
+---
+
+## What Works Today
+
+- **Tensor system (CPU)**: n-dim tensors, broadcasting, views, F32/F64/I32/I64/F16/Bool,
+  creation ops, indexing, reductions, `cat`/`stack`/`squeeze`/`unsqueeze`.
+- **Autograd**: tape-based reverse-mode AD with verified backward passes for
+  `add`, `sub`, `mul`, `div` (all with broadcast gradient reduction), `matmul`,
+  `sum`, `mean`, `sum_dim`, `cat`, `pow`, `exp`, `log`, `relu`, `sigmoid`,
+  `tanh`, `neg`. Gradient accumulation and `no_grad`.
+- **End-to-end training**: `Linear` + activations + `SGD`/`Adam` train real
+  models. Optimizer steps update parameters in place through shared storage.
+- **CUDA via dlopen**: driver API (`libcuda.so.1`), cuBLAS (`libcublas.so`),
+  NVRTC-compiled fused element-wise kernels, a GPU memory pool. The same binary
+  runs on machines with or without a GPU.
+- **Data utilities**: `Dataset`, `DataLoader`, samplers, transforms.
+- **217 passing tests** across the workspace (see
+  [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for the per-crate
+  breakdown and what the tests do and don't cover).
+
+## Known Limitations
+
+Read this before choosing FERRUM for anything real:
+
+1. **GPU compute is F32-only and requires backend registration.** Call
+   `ferrum_cuda::register_gpu_backend()` at startup (the examples do this
+   automatically when they detect a GPU). Other dtypes on `Device::Cuda`
+   error loudly. Verified 28/28 on A100 by
+   `cargo run --release --example gpu_smoke`; re-run it after touching
+   dispatch or kernel code.
+2. **CPU `matmul` is a naive triple loop.** The tiled/parallel/BLAS variants in
+   `ferrum-ops` exist but are not wired into `Tensor::matmul`. CPU training is
+   correct but slow — fine for examples, not for real workloads.
+3. **`expand` is invisible to autograd.** Pre-expanding a tensor
+   (`t.unsqueeze(0)?.expand(...)`) before an op yields a gradient with the
+   *expanded* shape. Use implicit broadcasting (`x.add(&bias)`) instead — its
+   backward correctly reduces gradients to each operand's shape.
+4. **Training is verified for MLP-style models only.** Conv, LSTM, GRU, and
+   Transformer layers have forward implementations and unit tests, but their
+   end-to-end trainability has not been demonstrated; several rely on ops whose
+   backward coverage is untested.
+5. **The MNIST example is forward-only** on synthetic data (no backward pass,
+   no optimizer step). It demonstrates the API, not learning. Use the XOR and
+   CIFAR-10 examples for real training.
+6. **`ferrum-serialize` has no tests.** Treat save/load as unverified.
+7. **FP16 matmul uses a CUDA-12-deprecated algorithm constant**
+   (`CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99`) because it measures 272 vs 230
+   TFLOPS against the non-deprecated default. This is a deliberate,
+   documented trade-off in `ferrum-cuda/src/cublas.rs`.
 
 ---
 
 ## Quick Start
 
-### Installation
-
-```toml
-[dependencies]
-ferrum = { git = "https://github.com/pratikacharya1234/FERRUM" }
-```
-
-Or build from source:
-
 ```bash
 git clone https://github.com/pratikacharya1234/FERRUM.git
 cd FERRUM
 cargo build --release
-cargo test
+cargo test --workspace
 ```
 
-### XOR Training Example
+### Train XOR (verified: 100% accuracy)
+
+```bash
+cargo run --release --example train_xor_autograd
+```
+
+The core pattern, from that example:
 
 ```rust
 use ferrum::prelude::*;
+use ferrum_autograd::tape::GradientTape;
+use ferrum_optim::{Optimizer, SGDConfig, SGD};
 
-fn main() -> Result<()> {
-    // XOR dataset
-    let inputs = Tensor::from_slice(&[0., 0., 0., 1., 1., 0., 1., 1.], [4, 2], Device::Cpu);
-    let targets = Tensor::from_slice(&[0., 1., 1., 0.], [4, 1], Device::Cpu);
+let w1 = Tensor::randn([2, 4], DType::F32, Device::Cpu).with_requires_grad(true);
+let b1 = Tensor::zeros([4], DType::F32, Device::Cpu).with_requires_grad(true);
+// ... more parameters ...
+let mut optimizer = SGD::new(vec![w1.clone(), b1.clone()], SGDConfig::new(0.5));
 
-    // Build model: 2 -> 8 -> 1
-    let model = Sequential::new()
-        .add(Linear::new(2, 8))
-        .add(Tanh::new())
-        .add(Linear::new(8, 1))
-        .add(Sigmoid::new());
-
-    // Train
-    let optimizer = SGD::new(model.parameters(), SGDConfig { lr: 1.0, ..Default::default() });
-    
-    for epoch in 0..2000 {
-        let output = model.forward(&inputs)?;
-        let loss = bce_loss(&output, &targets)?;
-        
-        backward(&loss)?;
-        optimizer.step()?;
+for _epoch in 0..1000 {
+    GradientTape::with_tape(|_tape| -> Result<()> {
         optimizer.zero_grad();
-    }
-    
-    // Test - achieves 100% accuracy
-    let predictions = model.forward(&inputs)?;
-    println!("Predictions: {:?}", predictions);
-    
-    Ok(())
+        let hidden = x.matmul(&w1)?.add(&b1)?.tanh()?; // bias broadcasts
+        // ... forward to a scalar loss ...
+        loss.backward()?;
+        Ok(())
+    })?;
+    optimizer.step()?;
 }
 ```
 
-Run the example:
+### Train CIFAR-10 (real data, MLP)
 
 ```bash
-cargo run --example train_xor
-# Output: Accuracy: 4/4 (100.0%)
+curl -L -o cifar-10-binary.tar.gz https://www.cs.toronto.edu/~kriz/cifar-10-binary.tar.gz
+mkdir -p data && tar xzf cifar-10-binary.tar.gz -C data
+cargo run --release --example cifar10
 ```
 
----
+Uses `ferrum_nn::Linear`, differentiable cross-entropy, and Adam on real
+CIFAR-10 images. Configure via `CIFAR10_DIR`, `CIFAR10_TRAIN`, `CIFAR10_TEST`,
+`CIFAR10_EPOCHS`. Runs on CPU (see limitation #1), so it defaults to a
+5000-image subset.
 
-## Crate Structure
-
-```
-ferrum/
-  ferrum-core        Tensor, DType, Device, Shape, Storage
-  ferrum-autograd    Automatic differentiation, backward pass
-  ferrum-ops         Tensor operations (add, matmul, etc.)
-  ferrum-nn          Neural network layers
-  ferrum-optim       Optimizers (SGD, Adam)
-  ferrum-data        DataLoader, Dataset, Samplers
-  ferrum-distributed Distributed training (DDP)
-  ferrum-cuda        GPU support (simulated)
-  ferrum-serialize   Save/load models
-  ferrum-examples    Working examples
-  ferrum             Main facade crate
-```
-
----
-
-## Neural Network Layers
-
-```rust
-use ferrum::prelude::*;
-
-let model = Sequential::new()
-    .add(Linear::new(784, 256))
-    .add(ReLU::new())
-    .add(LayerNorm::new(vec![256]))
-    .add(Linear::new(256, 10))
-    .add(Softmax::new(-1));
-
-let output = model.forward(&input)?;
-```
-
-### Available Layers
-
-| Layer | Description |
-|-------|-------------|
-| Linear | Fully connected |
-| ReLU, Sigmoid, Tanh | Basic activations |
-| GELU, SiLU, LeakyReLU, ELU | Advanced activations |
-| Softmax, LogSoftmax | Probability outputs |
-| LayerNorm, BatchNorm1d | Normalization |
-| Dropout | Regularization |
-| Sequential | Layer container |
-
----
-
-## Data Loading
-
-```rust
-use ferrum::prelude::*;
-
-let dataset = TensorDataset::new(train_inputs, train_targets);
-
-let loader = DataLoader::new(dataset)
-    .batch_size(32)
-    .shuffle(true)
-    .num_workers(4);
-
-for batch in &loader {
-    let (inputs, targets) = batch;
-    // training code
-}
-```
-
----
-
-## Optimizers
-
-```rust
-// SGD with momentum
-let optimizer = SGD::new(params, SGDConfig {
-    lr: 0.01,
-    momentum: 0.9,
-    weight_decay: 1e-4,
-    ..Default::default()
-});
-
-// Adam
-let optimizer = Adam::new(params, AdamConfig {
-    lr: 0.001,
-    betas: (0.9, 0.999),
-    eps: 1e-8,
-    weight_decay: 0.0,
-});
-
-// Training step
-optimizer.zero_grad();
-let loss = compute_loss()?;
-backward(&loss)?;
-optimizer.step()?;
-```
-
----
-
-## Loss Functions
-
-| Function | Use Case |
-|----------|----------|
-| mse_loss | Regression |
-| bce_loss | Binary classification |
-| cross_entropy_loss | Multi-class classification |
-| nll_loss | With log_softmax output |
-| l1_loss | Robust regression |
-| smooth_l1_loss | Object detection |
-
----
-
-## Running Tests
+### GPU benchmarks (requires NVIDIA GPU)
 
 ```bash
-cargo test --workspace         # All 154 tests
-cargo test -p ferrum-autograd  # Specific crate
-cargo test -- --nocapture      # With output
+cargo run --release --example bench
 ```
 
 ---
 
-## Roadmap
+## Architecture
 
-### v1.1 (Planned)
-- Conv2d, MaxPool2d layers
-- BLAS integration (OpenBLAS)
+```
+ferrum (facade)
+ ├── ferrum-core      Tensor, Shape, DType, Device, Storage (CPU + CUDA alloc)
+ ├── ferrum-cuda      CUDA Driver API, cuBLAS, NVRTC fusion — all via dlopen
+ ├── ferrum-autograd  Gradient tape, backward pass
+ ├── ferrum-ops       Standalone matmul variants (naive/tiled/parallel/BLAS)
+ ├── ferrum-nn        Layers: Linear, Conv, RNN/LSTM/GRU, Transformer, norms
+ ├── ferrum-optim     SGD, Adam, LR schedulers, grad scaler
+ ├── ferrum-data      DataLoader, datasets, samplers, transforms
+ ├── ferrum-distributed  ProcessGroup, DDP scaffolding (TCP/Gloo-style)
+ ├── ferrum-serialize Safetensors-style save/load (untested)
+ └── ferrum-examples  XOR, CIFAR-10, MNIST (forward-only), GPU bench, grad probe
+```
 
-### v1.2 (Planned)
-- LSTM, GRU layers
-- Real CUDA support
+`Device::default()` returns `Cuda(0)` when a GPU is detected, else `Cpu`.
+Given limitation #1, pass `Device::Cpu` explicitly for training today.
 
-### v1.3 (Planned)
-- Transformer layers
-- Attention mechanisms
+---
+
+## Roadmap (honest ordering)
+
+1. ~~**GPU op dispatch**~~ — **done and A100-verified (2026-07-24).**
+   `Tensor` ops route to cuBLAS/NVRTC for `Device::Cuda` tensors; 28/28
+   correctness gate. Remaining polish: F16/F64 dtypes, multi-GPU contexts.
+2. **`cublasLt` matmul** — workspace + heuristic algorithm search to close the
+   FP16 gap (272 → ~312 TFLOPS).
+3. **CPU BLAS matmul** — wire `ferrum-ops`' faster matmuls into `Tensor::matmul`.
+4. **Backward coverage for conv/recurrent/attention** — make the remaining
+   layers trainable, with gradient checks.
+5. **Serialization tests**, ONNX export, NCCL — after the above.
 
 ---
 
 ## Contributing
 
-Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Priority areas:
-1. Convolutional layers
-2. BLAS integration
-3. Real CUDA kernels
-4. More examples
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md). The highest-impact areas are exactly
+the roadmap items above.
 
 ## License
 
-Apache 2.0
-
----
+Apache 2.0 — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-Inspired by PyTorch, tch-rs, and candle.
-
----
-
-FERRUM is a real, working framework suitable for learning, prototypes, and small projects. For production ML at scale, consider PyTorch, TensorFlow, or JAX.
+Inspired by PyTorch, Candle (HuggingFace), and Burn (Tracel).
+Built by [Pratik Acharya](https://github.com/pratikacharya1234).

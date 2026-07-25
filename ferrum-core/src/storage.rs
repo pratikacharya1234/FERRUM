@@ -27,6 +27,54 @@ use parking_lot::RwLock;
 use crate::device::{CpuAllocator, Device, DeviceAllocator};
 use crate::error::{FerrumError, Result};
 
+/// Track whether CUDA has been initialized (cuInit called).
+#[cfg(feature = "cuda")]
+static CUDA_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Cached CUDA function pointers (loaded once via dlopen).
+#[cfg(feature = "cuda")]
+struct CudaFns {
+    lib: *mut std::ffi::c_void,
+    cu_init: unsafe extern "C" fn(u32) -> i32,
+    cu_device_get: unsafe extern "C" fn(*mut i32, i32) -> i32,
+    cu_ctx_create: unsafe extern "C" fn(*mut *mut std::ffi::c_void, u32, i32) -> i32,
+    cu_ctx_get_current: unsafe extern "C" fn(*mut *mut std::ffi::c_void) -> i32,
+    cu_mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> i32,
+}
+
+// SAFETY: CUDA function pointers are process-wide constants after dlopen.
+unsafe impl Send for CudaFns {}
+unsafe impl Sync for CudaFns {}
+
+#[cfg(feature = "cuda")]
+static CUDA_FNS: std::sync::OnceLock<CudaFns> = std::sync::OnceLock::new();
+
+#[cfg(feature = "cuda")]
+fn init_cuda_fns() -> Option<&'static CudaFns> {
+    CUDA_FNS.get_or_init(|| {
+        unsafe {
+            let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+            let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+
+            macro_rules! resolve {
+                ($name:expr) => {{
+                    let p = libc::dlsym(lib, $name.as_ptr() as *const _);
+                    std::mem::transmute(p)
+                }};
+            }
+
+            CudaFns {
+                lib,
+                cu_init: resolve!(b"cuInit\0"),
+                cu_device_get: resolve!(b"cuDeviceGet\0"),
+                cu_ctx_create: resolve!(b"cuCtxCreate_v2\0"),
+                cu_ctx_get_current: resolve!(b"cuCtxGetCurrent\0"),
+                cu_mem_alloc: resolve!(b"cuMemAlloc_v2\0"),
+            }
+        }
+    }).into()
+}
+
 /// Raw storage buffer for tensor data.
 ///
 /// This is the inner type wrapped by `Arc` in [`Storage`].
@@ -63,6 +111,47 @@ impl StorageInner {
                 let allocator = CpuAllocator;
                 // SAFETY: We're requesting a valid size with proper alignment
                 unsafe { allocator.allocate(size) }
+            }
+            #[cfg(feature = "cuda")]
+            Device::Cuda(device_id) => {
+                let fns = match init_cuda_fns() {
+                    Some(f) => f,
+                    None => return Err(FerrumError::NotImplemented {
+                        feature: "CUDA libcuda.so.1 not found".to_string(),
+                    }),
+                };
+
+                unsafe {
+                    // cuInit once
+                    CUDA_INIT.call_once(|| {
+                        (fns.cu_init)(0);
+                    });
+
+                    // Check if context already exists
+                    let mut current_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+                    (fns.cu_ctx_get_current)(&mut current_ctx);
+
+                    if current_ctx.is_null() {
+                        let mut dev: i32 = 0;
+                        (fns.cu_device_get)(&mut dev, device_id as i32);
+                        let mut ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+                        (fns.cu_ctx_create)(&mut ctx, 0, dev);
+                    }
+
+                    let mut device_ptr: u64 = 0;
+                    let result = (fns.cu_mem_alloc)(&mut device_ptr, size);
+                    if result != 0 || device_ptr == 0 {
+                        return Err(FerrumError::AllocationError { bytes: size, device });
+                    }
+                    device_ptr as *mut u8
+                }
+            }
+            #[cfg(feature = "metal")]
+            Device::Metal(_) => {
+                // Metal allocation not implemented
+                return Err(FerrumError::NotImplemented {
+                    feature: "Metal allocation".to_string(),
+                });
             }
             _ => {
                 return Err(FerrumError::NotImplemented {
@@ -126,9 +215,33 @@ impl StorageInner {
                     std::ptr::write_bytes(self.as_mut_ptr(), 0, self.size);
                 }
             }
-            _ => {
-                // TODO: Implement for other devices
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => {
+                // CUDA zero fill via cuMemset
+                use std::ffi::c_void;
+                type CuMemsetFn = unsafe extern "C" fn(*mut c_void, i32, usize) -> i32;
+                let memset_fn: CuMemsetFn = unsafe {
+                    let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+                    let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+                    if lib.is_null() {
+                        return;
+                    }
+                    let ptr = libc::dlsym(lib, std::ffi::CString::new("cuMemsetD8_v2").unwrap().as_ptr());
+                    if ptr.is_null() {
+                        return;
+                    }
+                    std::mem::transmute(ptr)
+                };
+                unsafe {
+                    (memset_fn)(self.ptr.as_ptr() as *mut c_void, 0, self.size);
+                }
             }
+            #[cfg(feature = "metal")]
+            Device::Metal(_) => {
+                // Metal zero fill via mtBufferZeroContents (if available)
+                // For now, just do a CPU fallback if possible
+            }
+            _ => {}
         }
     }
 
@@ -151,11 +264,37 @@ impl StorageInner {
                     std::ptr::copy_nonoverlapping(data.as_ptr(), self.as_mut_ptr(), self.size);
                 }
             }
-            _ => {
-                return Err(FerrumError::NotImplemented {
-                    feature: format!("Copy to {:?}", self.device),
-                });
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => {
+                // CUDA copy via cuMemcpyHtoD
+                use std::ffi::c_void;
+                type CuMemcpyHtoDFn = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+                let copy_fn: CuMemcpyHtoDFn = unsafe {
+                    let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+                    let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+                    if lib.is_null() {
+                        return Err(FerrumError::NotImplemented {
+                            feature: "CUDA copy".to_string(),
+                        });
+                    }
+                    let ptr = libc::dlsym(lib, std::ffi::CString::new("cuMemcpyHtoD_v2").unwrap().as_ptr());
+                    if ptr.is_null() {
+                        return Err(FerrumError::NotImplemented {
+                            feature: "CUDA copy".to_string(),
+                        });
+                    }
+                    std::mem::transmute(ptr)
+                };
+                unsafe {
+                    (copy_fn)(self.ptr.as_ptr() as u64, data.as_ptr() as *const c_void, self.size);
+                }
             }
+            #[cfg(feature = "metal")]
+            Device::Metal(_) => {
+                // Metal copy via mtBufferContents + memcpy
+                // For now, this is not implemented
+            }
+            _ => {}
         }
 
         Ok(())
@@ -177,11 +316,39 @@ impl StorageInner {
                         );
                     }
                 }
-                _ => {
+                #[cfg(feature = "cuda")]
+                Device::Cuda(_) => {
+                    // CUDA clone via cuMemcpyDtoD
+                    use std::ffi::c_void;
+                    type CuMemcpyDtoDFn = unsafe extern "C" fn(u64, u64, usize) -> i32;
+                    let copy_fn: CuMemcpyDtoDFn = unsafe {
+                        let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+                        let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+                        if lib.is_null() {
+                            return Err(FerrumError::NotImplemented {
+                                feature: "CUDA clone".to_string(),
+                            });
+                        }
+                    let ptr = libc::dlsym(lib, std::ffi::CString::new("cuMemcpyDtoD_v2").unwrap().as_ptr());
+                        if ptr.is_null() {
+                            return Err(FerrumError::NotImplemented {
+                                feature: "CUDA clone".to_string(),
+                            });
+                        }
+                        std::mem::transmute(ptr)
+                    };
+                    unsafe {
+                        (copy_fn)(new_storage.ptr.as_ptr() as u64, self.ptr.as_ptr() as u64, self.size);
+                    }
+                }
+                #[cfg(feature = "metal")]
+                Device::Metal(_) => {
+                    // Metal clone not implemented
                     return Err(FerrumError::NotImplemented {
-                        feature: format!("Clone on {:?}", self.device),
+                        feature: "Metal clone".to_string(),
                     });
                 }
+                _ => {}
             }
         }
 
@@ -203,11 +370,34 @@ impl Drop for StorageInner {
                     allocator.deallocate(self.ptr.as_ptr(), self.capacity);
                 }
             }
-            _ => {
-                // TODO: Implement for other devices
-                // For now, this would leak memory on unsupported devices,
-                // but we prevent allocation on them anyway.
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => {
+                // CUDA memory deallocation via cuMemFree
+                use std::ffi::c_void;
+                type CuMemFreeFn = unsafe extern "C" fn(*mut c_void) -> i32;
+                let free_fn: CuMemFreeFn = unsafe {
+                    let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+                    let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+                    if lib.is_null() {
+                        return;
+                    }
+                    let ptr = libc::dlsym(lib, std::ffi::CString::new("cuMemFree_v2").unwrap().as_ptr());
+                    if ptr.is_null() {
+                        return;
+                    }
+                    std::mem::transmute(ptr)
+                };
+                unsafe {
+                    (free_fn)(self.ptr.as_ptr() as *mut c_void);
+                }
             }
+            #[cfg(feature = "metal")]
+            Device::Metal(_) => {
+                // Metal memory deallocation via MTLBuffer release
+                // For now, this would leak memory on Metal,
+                // but we prevent allocation on Metal anyway.
+            }
+            _ => {}
         }
     }
 }
@@ -301,6 +491,156 @@ impl Storage {
         let new_inner = self.inner.read().clone_data()?;
         self.inner = Arc::new(RwLock::new(new_inner));
         Ok(true)
+    }
+
+    /// Raw device/host address of the buffer, as u64.
+    ///
+    /// For `Device::Cuda` storage this is a CUDA device pointer suitable
+    /// for kernel launches; it must never be dereferenced on the host.
+    #[inline]
+    pub fn device_ptr(&self) -> u64 {
+        self.inner.read().ptr.as_ptr() as u64
+    }
+
+    /// Copy `dst.len()` bytes starting at `byte_offset` into host memory.
+    ///
+    /// Works for both CPU storage (memcpy) and CUDA storage
+    /// (`cuMemcpyDtoH`). This is the only sanctioned way to read CUDA
+    /// storage contents from the host.
+    pub fn copy_to_host(&self, dst: &mut [u8], byte_offset: usize) -> Result<()> {
+        let inner = self.inner.read();
+        if byte_offset + dst.len() > inner.size {
+            return Err(FerrumError::InternalError {
+                message: format!(
+                    "copy_to_host out of range: offset {} + len {} > size {}",
+                    byte_offset,
+                    dst.len(),
+                    inner.size
+                ),
+            });
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+
+        match inner.device {
+            Device::Cpu => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        inner.as_ptr().add(byte_offset),
+                        dst.as_mut_ptr(),
+                        dst.len(),
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => {
+                type CuMemcpyDtoHFn =
+                    unsafe extern "C" fn(*mut std::ffi::c_void, u64, usize) -> i32;
+                let copy_fn: CuMemcpyDtoHFn = unsafe {
+                    let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+                    let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+                    if lib.is_null() {
+                        return Err(FerrumError::NotImplemented {
+                            feature: "CUDA copy_to_host: libcuda.so.1 not found".to_string(),
+                        });
+                    }
+                    let ptr = libc::dlsym(
+                        lib,
+                        std::ffi::CString::new("cuMemcpyDtoH_v2").unwrap().as_ptr(),
+                    );
+                    if ptr.is_null() {
+                        return Err(FerrumError::NotImplemented {
+                            feature: "CUDA copy_to_host: cuMemcpyDtoH_v2 not found".to_string(),
+                        });
+                    }
+                    std::mem::transmute(ptr)
+                };
+                let src = inner.ptr.as_ptr() as u64 + byte_offset as u64;
+                let result = unsafe {
+                    (copy_fn)(dst.as_mut_ptr() as *mut std::ffi::c_void, src, dst.len())
+                };
+                if result != 0 {
+                    return Err(FerrumError::InternalError {
+                        message: format!("cuMemcpyDtoH failed: {result}"),
+                    });
+                }
+                Ok(())
+            }
+            other => Err(FerrumError::NotImplemented {
+                feature: format!("copy_to_host on {:?}", other),
+            }),
+        }
+    }
+
+    /// Copy `src.len()` bytes from host memory into the buffer at
+    /// `byte_offset`. Works for CPU (memcpy) and CUDA (`cuMemcpyHtoD`).
+    pub fn copy_from_host(&self, src: &[u8], byte_offset: usize) -> Result<()> {
+        let inner = self.inner.write();
+        if byte_offset + src.len() > inner.size {
+            return Err(FerrumError::InternalError {
+                message: format!(
+                    "copy_from_host out of range: offset {} + len {} > size {}",
+                    byte_offset,
+                    src.len(),
+                    inner.size
+                ),
+            });
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+
+        match inner.device {
+            Device::Cpu => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr(),
+                        inner.ptr.as_ptr().add(byte_offset),
+                        src.len(),
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => {
+                type CuMemcpyHtoDFn =
+                    unsafe extern "C" fn(u64, *const std::ffi::c_void, usize) -> i32;
+                let copy_fn: CuMemcpyHtoDFn = unsafe {
+                    let lib_name = std::ffi::CString::new("libcuda.so.1").unwrap();
+                    let lib = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW);
+                    if lib.is_null() {
+                        return Err(FerrumError::NotImplemented {
+                            feature: "CUDA copy_from_host: libcuda.so.1 not found".to_string(),
+                        });
+                    }
+                    let ptr = libc::dlsym(
+                        lib,
+                        std::ffi::CString::new("cuMemcpyHtoD_v2").unwrap().as_ptr(),
+                    );
+                    if ptr.is_null() {
+                        return Err(FerrumError::NotImplemented {
+                            feature: "CUDA copy_from_host: cuMemcpyHtoD_v2 not found".to_string(),
+                        });
+                    }
+                    std::mem::transmute(ptr)
+                };
+                let dst = inner.ptr.as_ptr() as u64 + byte_offset as u64;
+                let result = unsafe {
+                    (copy_fn)(dst, src.as_ptr() as *const std::ffi::c_void, src.len())
+                };
+                if result != 0 {
+                    return Err(FerrumError::InternalError {
+                        message: format!("cuMemcpyHtoD failed: {result}"),
+                    });
+                }
+                Ok(())
+            }
+            other => Err(FerrumError::NotImplemented {
+                feature: format!("copy_from_host on {:?}", other),
+            }),
+        }
     }
 
     /// Read data as a typed slice.

@@ -31,6 +31,8 @@ pub mod autograd_ops;
 pub mod device;
 pub mod dtype;
 pub mod error;
+pub mod gpu;
+pub mod memory_format;
 pub mod shape;
 pub mod storage;
 pub mod tensor;
@@ -41,6 +43,7 @@ pub mod prelude {
     pub use crate::device::Device;
     pub use crate::dtype::DType;
     pub use crate::error::{FerrumError, Result};
+    pub use crate::memory_format::{MemoryFormat, FormatStrides};
     pub use crate::shape::Shape;
     pub use crate::tensor::Tensor;
 }

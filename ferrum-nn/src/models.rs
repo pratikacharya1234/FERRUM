@@ -140,9 +140,10 @@ impl Module for ResNet {
 
         let x = self.avgpool.forward(&x)?;
         
-        // Flatten
+        // Flatten: [batch, channels, 1, 1] -> [batch, channels]
         let batch = x.shape()[0];
-        let x = x.reshape([batch, 512])?;
+        let channels = x.shape()[1];
+        let x = x.reshape([batch, channels])?;
         
         self.fc.forward(&x)
     }
@@ -174,11 +175,13 @@ pub struct VGG {
 impl VGG {
     /// Create VGG-16.
     pub fn vgg16(num_classes: usize) -> Self {
+        // VGG-16: [64,64,M, 128,128,M, 256,256,256,M, 512,512,512,M, 512,512,512,M]
         Self::new(&[64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512], num_classes)
     }
 
     /// Create VGG-19.
     pub fn vgg19(num_classes: usize) -> Self {
+        // VGG-19: [64,64,M, 128,128,M, 256,256,256,256,M, 512,512,512,512,M, 512,512,512,512,M]
         Self::new(&[64, 64, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 512, 512, 512, 512], num_classes)
     }
 
@@ -186,13 +189,30 @@ impl VGG {
         let mut features: Vec<Box<dyn Module>> = Vec::new();
         let mut in_channels = 3;
 
-        for &v in cfg {
+        // VGG architecture: Conv layers with MaxPool after each block
+        // Block boundaries (after these indices, insert MaxPool): 1, 3, 6, 9, 12 for VGG-16
+        let pool_after = |idx: usize, total: usize| -> bool {
+            // Insert MaxPool after every 2-3 conv layers at block boundaries
+            match total {
+                13 => idx == 1 || idx == 3 || idx == 6 || idx == 9 || idx == 12,  // VGG-16
+                16 => idx == 1 || idx == 3 || idx == 6 || idx == 10 || idx == 13, // VGG-19
+                _ => (idx + 1) % 3 == 0 || idx == total - 1,
+            }
+        };
+
+        for (i, &v) in cfg.iter().enumerate() {
             features.push(Box::new(Conv2d::new(in_channels, v, 3).padding(1)));
             in_channels = v;
+            if pool_after(i, cfg.len()) {
+                features.push(Box::new(MaxPool2d::new(2)));
+            }
         }
 
+        // Calculate flattened size: after 5 MaxPool2d(2), spatial dim / 32
+        // For 224x224 input: 224 / 32 = 7, so 512 * 7 * 7
+        let flat_size = 512 * 7 * 7;
         let classifier = vec![
-            Linear::new(512 * 7 * 7, 4096),
+            Linear::new(flat_size, 4096),
             Linear::new(4096, 4096),
             Linear::new(4096, num_classes),
         ];

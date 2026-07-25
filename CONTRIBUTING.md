@@ -277,52 +277,42 @@ How was this tested?
 
 ## Areas We Need Help
 
+These mirror the phases in
+[IMPLEMENTATION_ROADMAP.md](IMPLEMENTATION_ROADMAP.md) — read
+[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) first so you know what
+is verified vs merely existing.
+
 ### High Priority
 
-1. **Complete Autograd Integration**
-   - Connect tape recording to tensor operations
-   - Implement backward() method
-   - Test gradient flow end-to-end
+1. **GPU op dispatch** (roadmap Phase 1)
+   - Route `Tensor::matmul` / element-wise ops to the existing cuBLAS/NVRTC
+     layer when tensors live on `Device::Cuda`
+   - Today GPU tensors are storage-only; this is the framework's biggest gap
 
-2. **Performance Optimization**
-   - Optimize matmul (BLAS integration)
-   - Add SIMD kernels
-   - Parallelize operations with Rayon
+2. **`cublasLt` FP16 matmul** (Phase 2)
+   - Workspace allocation + `cublasLtMatmulAlgoGetHeuristic` via dlopen
+   - Target: close the measured 272 → ~312 TFLOPS gap vs PyTorch on A100
 
-3. **Additional Layers**
-   - Conv2D, Conv1D
-   - BatchNorm, LayerNorm
-   - Dropout
-   - Embedding
+3. **Fast CPU matmul** (Phase 3)
+   - Wire `ferrum-ops`' tiled/parallel/BLAS matmul into `Tensor::matmul`
+     (currently a naive triple loop)
 
 ### Medium Priority
 
-4. **Loss Functions**
-   - CrossEntropyLoss with logits
-   - Focal Loss
-   - Custom loss examples
+4. **Backward coverage for existing layers** (Phase 4)
+   - Conv, pooling, recurrent, attention layers have forwards but
+     undemonstrated trainability
+   - Includes making `transpose`/`expand` autograd-tracked (see the known
+     issues in IMPLEMENTATION_STATUS.md) and adding `grad_probe`-style
+     gradient checks
 
-5. **Data Loading**
-   - Dataset trait
-   - DataLoader with batching
-   - Common dataset implementations
-
-6. **GPU Backend**
-   - CUDA kernel integration
-   - Device memory management
-   - cuBLAS for operations
+5. **Serialization tests** (Phase 5)
+   - `ferrum-serialize` currently has zero tests; round-trip coverage needed
 
 ### Low Priority
 
-7. **Documentation**
-   - More examples
-   - Tutorial notebooks
-   - API reference improvements
-
-8. **Tooling**
-   - Benchmarking suite
-   - Profiling utilities
-   - Debugging helpers
+6. **Documentation and tooling**
+   - More verified examples, profiling utilities, CI with GPU runners
 
 ---
 

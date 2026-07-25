@@ -86,11 +86,12 @@ impl Default for LeakyReLU {
 
 impl Module for LeakyReLU {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        // TODO: Implement proper leaky relu kernel
-        // For now, use a simple approximation
-        let positive = input.relu()?;
-        let negative = input.neg()?.relu()?.mul_scalar(-self.negative_slope)?;
-        positive.add(&negative)
+        // LeakyReLU: x if x > 0 else negative_slope * x
+        let data = input.to_vec::<f32>()?;
+        let output: Vec<f32> = data.iter()
+            .map(|&x| if x > 0.0 { x } else { self.negative_slope as f32 * x })
+            .collect();
+        Tensor::from_slice(&output, input.shape().to_vec(), input.device())
     }
 
     fn name(&self) -> &str {
@@ -215,10 +216,11 @@ impl Default for ELU {
 impl Module for ELU {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         // ELU: x if x > 0 else alpha * (exp(x) - 1)
-        let positive = input.relu()?;
-        let negative_mask = input.neg()?.relu()?.neg()?; // Gets negative values as negative
-        let exp_minus_one = negative_mask.exp()?.add_scalar(-1.0)?;
-        positive.add(&exp_minus_one.mul_scalar(self.alpha)?)
+        let data = input.to_vec::<f32>()?;
+        let output: Vec<f32> = data.iter()
+            .map(|&x| if x > 0.0 { x } else { self.alpha as f32 * (x.exp() - 1.0) })
+            .collect();
+        Tensor::from_slice(&output, input.shape().to_vec(), input.device())
     }
 
     fn name(&self) -> &str {
@@ -230,41 +232,103 @@ impl Module for ELU {
 // Functional API
 // ============================================================================
 
-/// Softmax function.
-/// Note: For better numerical stability, consider subtracting max first.
-pub fn softmax(input: &Tensor, _dim: i64) -> Result<Tensor> {
-    // Simple softmax without max subtraction
-    // TODO: Add max subtraction for numerical stability when max() is implemented
-    let exp_x = input.exp()?;
-    let sum = exp_x.sum()?;
-    exp_x.div(&sum.expand(input.shape_obj().clone())?)
+/// Softmax function along specified dimension.
+/// Numerically stable: subtracts max before exp.
+pub fn softmax(input: &Tensor, dim: i64) -> Result<Tensor> {
+    let shape = input.shape();
+    let ndim = shape.len() as i64;
+    let dim = if dim < 0 { ndim + dim } else { dim } as usize;
+
+    // For last-dim softmax (most common), use optimized path
+    if dim == (ndim - 1) as usize {
+        let data = input.to_vec::<f32>()?;
+        let mut output = vec![0.0f32; data.len()];
+        let outer: usize = shape[..dim].iter().product();
+        let inner = shape[dim];
+
+        for o in 0..outer {
+            let base = o * inner;
+            // Find max for numerical stability
+            let mut max_val = f32::NEG_INFINITY;
+            for j in 0..inner {
+                max_val = max_val.max(data[base + j]);
+            }
+            // Compute exp(x - max) and sum
+            let mut sum = 0.0f32;
+            for j in 0..inner {
+                let v = (data[base + j] - max_val).exp();
+                output[base + j] = v;
+                sum += v;
+            }
+            // Normalize
+            for j in 0..inner {
+                output[base + j] /= sum;
+            }
+        }
+        Tensor::from_slice(&output, shape.to_vec(), input.device())
+    } else {
+        // Generic dim softmax
+        let data = input.to_vec::<f32>()?;
+        let mut output = vec![0.0f32; data.len()];
+        let dim_size = shape[dim];
+        let outer: usize = shape[..dim].iter().product();
+        let inner: usize = shape[dim + 1..].iter().product();
+
+        for o in 0..outer {
+            for i in 0..inner {
+                // Find max
+                let mut max_val = f32::NEG_INFINITY;
+                for d in 0..dim_size {
+                    let idx = o * dim_size * inner + d * inner + i;
+                    max_val = max_val.max(data[idx]);
+                }
+                // Compute exp and sum
+                let mut sum = 0.0f32;
+                for d in 0..dim_size {
+                    let idx = o * dim_size * inner + d * inner + i;
+                    let v = (data[idx] - max_val).exp();
+                    output[idx] = v;
+                    sum += v;
+                }
+                // Normalize
+                for d in 0..dim_size {
+                    let idx = o * dim_size * inner + d * inner + i;
+                    output[idx] /= sum;
+                }
+            }
+        }
+        Tensor::from_slice(&output, shape.to_vec(), input.device())
+    }
 }
 
-/// Log softmax function.
-pub fn log_softmax(input: &Tensor, _dim: i64) -> Result<Tensor> {
-    // log_softmax(x) = x - log(sum(exp(x)))
-    // Simple implementation
-    let exp_x = input.exp()?;
-    let sum_exp = exp_x.sum()?;
-    let log_sum_exp = sum_exp.log()?;
-    input.sub(&log_sum_exp.expand(input.shape_obj().clone())?)
+/// Log softmax function along specified dimension.
+pub fn log_softmax(input: &Tensor, dim: i64) -> Result<Tensor> {
+    let sm = softmax(input, dim)?;
+    sm.log()
 }
 
 /// GELU activation function.
 pub fn gelu(input: &Tensor) -> Result<Tensor> {
-    // Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
-    let sqrt_2_over_pi = 0.7978845608028654; // sqrt(2/π)
-    let x_cubed = input.pow(3.0)?;
-    let inner = input.add(&x_cubed.mul_scalar(0.044715)?)?;
-    let tanh_val = inner.mul_scalar(sqrt_2_over_pi)?.tanh()?;
-    let one_plus_tanh = tanh_val.add_scalar(1.0)?;
-    input.mul(&one_plus_tanh)?.mul_scalar(0.5)
+    // GELU: x * Φ(x) where Φ is the standard Gaussian CDF
+    // Approximate: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    let data = input.to_vec::<f32>()?;
+    let sqrt_2_over_pi = 0.7978845608028654f32;
+    let output: Vec<f32> = data.iter()
+        .map(|&x| {
+            let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+            0.5 * x * (1.0 + inner.tanh())
+        })
+        .collect();
+    Tensor::from_slice(&output, input.shape().to_vec(), input.device())
 }
 
 /// SiLU (Swish) activation: x * sigmoid(x)
 pub fn silu(input: &Tensor) -> Result<Tensor> {
-    let sigmoid = input.sigmoid()?;
-    input.mul(&sigmoid)
+    let data = input.to_vec::<f32>()?;
+    let output: Vec<f32> = data.iter()
+        .map(|&x| x * (1.0 / (1.0 + (-x).exp())))
+        .collect();
+    Tensor::from_slice(&output, input.shape().to_vec(), input.device())
 }
 
 #[cfg(test)]

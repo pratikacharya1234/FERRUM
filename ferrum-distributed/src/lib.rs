@@ -30,6 +30,9 @@ pub mod backend;
 pub mod collectives;
 pub mod ddp;
 pub mod error;
+pub mod gloo_backend;
+#[cfg(feature = "nccl")]
+pub mod nccl_backend;
 pub mod process_group;
 
 pub use backend::{Backend, BackendConfig};
@@ -37,6 +40,8 @@ pub use collectives::ReduceOp;
 pub use ddp::DistributedDataParallel;
 pub use error::{DistributedError, Result};
 pub use process_group::ProcessGroup;
+#[cfg(feature = "nccl")]
+pub use nccl_backend::NcclBackend;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::Mutex;
