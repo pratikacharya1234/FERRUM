@@ -192,11 +192,35 @@ impl Default for Dropout {
 impl Module for Dropout {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         if self.training && self.p > 0.0 {
-            // During training, scale by (1 - p) to approximate dropout
-            // TODO: Implement proper dropout with random mask when Tensor::rand is available
-            input.mul_scalar(1.0 - self.p)
+            // Generate random mask: keep with probability (1-p), scale by 1/(1-p)
+            let data = input.to_vec::<f32>()?;
+            let shape = input.shape();
+            let n = data.len();
+            
+            // Use a simple PRNG (xorshift32) seeded from current time
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            let mut rng_state = seed;
+            
+            let mut output = vec![0.0f32; n];
+            let scale = 1.0 / (1.0 - self.p as f32);
+            
+            for i in 0..n {
+                // xorshift32 PRNG
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 17;
+                rng_state ^= rng_state << 5;
+                let rand_val = (rng_state as f32) / (u32::MAX as f32);
+                
+                if rand_val >= self.p as f32 {
+                    output[i] = data[i] * scale;
+                }
+            }
+            
+            Tensor::from_slice(&output, shape.to_vec(), input.device())
         } else {
-            // During inference, return input unchanged
             Ok(input.clone())
         }
     }

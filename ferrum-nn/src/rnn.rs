@@ -269,27 +269,44 @@ impl RNN {
         let batch = input_shape[1];
         let num_directions = if self.bidirectional { 2 } else { 1 };
 
-        // Initialize hidden state
+        // Initialize hidden state for all layers
         let h = if let Some(h0) = h_0 {
             h0.clone()
         } else {
             Tensor::zeros((self.num_layers * num_directions, batch, self.hidden_size), DType::F32, input.device())
         };
 
-        // Process sequence (simplified - single layer, forward only for now)
-        let mut outputs = Vec::new();
-        let mut hidden = self.get_layer_hidden(&h, 0)?;
-
+        // Process sequence through all layers
+        let mut layer_outputs: Vec<Tensor> = Vec::new();
+        
+        // Layer 0: process input sequence
+        let mut current_hidden = self.get_layer_hidden(&h, 0)?;
+        let mut all_layer_outputs = Vec::new();
+        
         for t in 0..seq_len {
             let x_t = self.get_timestep(input, t)?;
-            hidden = self.cells[0].forward(&x_t, &hidden)?;
-            outputs.push(hidden.clone());
+            current_hidden = self.cells[0].forward(&x_t, &current_hidden)?;
+            all_layer_outputs.push(current_hidden.clone());
         }
-
-        // Stack outputs
-        let output = self.stack_outputs(&outputs, seq_len, batch)?;
+        layer_outputs.push(self.stack_outputs(&all_layer_outputs, seq_len, batch)?);
         
-        Ok((output, hidden))
+        // Layers 1..N: process previous layer's output sequence
+        for layer in 1..self.num_layers {
+            let prev_output = &layer_outputs[layer - 1];
+            current_hidden = self.get_layer_hidden(&h, layer)?;
+            let mut layer_out = Vec::new();
+            
+            for t in 0..seq_len {
+                let x_t = self.get_timestep(prev_output, t)?;
+                let cell_idx = layer * num_directions;
+                current_hidden = self.cells[cell_idx].forward(&x_t, &current_hidden)?;
+                layer_out.push(current_hidden.clone());
+            }
+            layer_outputs.push(self.stack_outputs(&layer_out, seq_len, batch)?);
+        }
+        
+        let output = layer_outputs.pop().unwrap();
+        Ok((output, current_hidden))
     }
 
     fn get_timestep(&self, input: &Tensor, t: usize) -> Result<Tensor> {
@@ -381,21 +398,48 @@ impl Module for LSTM {
         let shape = input.shape();
         let seq_len = shape[0];
         let batch = shape[1];
+        let num_directions = if self.bidirectional { 2 } else { 1 };
 
-        let mut h = Tensor::zeros((batch, self.hidden_size), DType::F32, input.device());
-        let mut c = Tensor::zeros((batch, self.hidden_size), DType::F32, input.device());
-
-        let mut outputs = Vec::new();
-
-        for t in 0..seq_len {
-            let x_t = get_timestep(input, t)?;
-            let (h_new, c_new) = self.cells[0].forward(&x_t, (&h, &c))?;
-            h = h_new;
-            c = c_new;
-            outputs.push(h.clone());
+        // Initialize hidden states for all layers
+        let mut h_states: Vec<Tensor> = Vec::new();
+        let mut c_states: Vec<Tensor> = Vec::new();
+        for _ in 0..self.num_layers * num_directions {
+            h_states.push(Tensor::zeros((batch, self.hidden_size), DType::F32, input.device()));
+            c_states.push(Tensor::zeros((batch, self.hidden_size), DType::F32, input.device()));
         }
 
-        stack_outputs(&outputs, seq_len, batch, self.hidden_size, input.device())
+        let mut layer_outputs: Vec<Tensor> = Vec::new();
+        
+        // Layer 0: process input sequence
+        let mut layer_out = Vec::new();
+        for t in 0..seq_len {
+            let x_t = get_timestep(input, t)?;
+            let (h_new, c_new) = self.cells[0].forward(&x_t, (&h_states[0], &c_states[0]))?;
+            h_states[0] = h_new;
+            c_states[0] = c_new.clone();
+            layer_out.push(h_states[0].clone());
+        }
+        layer_outputs.push(stack_outputs(&layer_out, seq_len, batch, self.hidden_size, input.device())?);
+        
+        // Layers 1..N
+        for layer in 1..self.num_layers {
+            let prev_output = &layer_outputs[layer - 1];
+            let mut layer_out = Vec::new();
+            
+            for t in 0..seq_len {
+                let x_t = get_timestep(prev_output, t)?;
+                let cell_idx = layer * num_directions;
+                let (h_new, c_new) = self.cells[cell_idx].forward(&x_t, (&h_states[cell_idx], &c_states[cell_idx]))?;
+                h_states[cell_idx] = h_new;
+                c_states[cell_idx] = c_new;
+                layer_out.push(h_states[cell_idx].clone());
+            }
+            layer_outputs.push(stack_outputs(&layer_out, seq_len, batch, self.hidden_size, input.device())?);
+        }
+        
+        layer_outputs.pop().ok_or_else(|| ferrum_core::FerrumError::InvalidShape {
+            message: "No layers processed".to_string(),
+        })
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -452,17 +496,42 @@ impl Module for GRU {
         let shape = input.shape();
         let seq_len = shape[0];
         let batch = shape[1];
+        let num_directions = if self.bidirectional { 2 } else { 1 };
 
-        let mut h = Tensor::zeros((batch, self.hidden_size), DType::F32, input.device());
-        let mut outputs = Vec::new();
-
-        for t in 0..seq_len {
-            let x_t = get_timestep(input, t)?;
-            h = self.cells[0].forward(&x_t, &h)?;
-            outputs.push(h.clone());
+        // Initialize hidden states for all layers
+        let mut h_states: Vec<Tensor> = Vec::new();
+        for _ in 0..self.num_layers * num_directions {
+            h_states.push(Tensor::zeros((batch, self.hidden_size), DType::F32, input.device()));
         }
 
-        stack_outputs(&outputs, seq_len, batch, self.hidden_size, input.device())
+        let mut layer_outputs: Vec<Tensor> = Vec::new();
+        
+        // Layer 0
+        let mut layer_out = Vec::new();
+        for t in 0..seq_len {
+            let x_t = get_timestep(input, t)?;
+            h_states[0] = self.cells[0].forward(&x_t, &h_states[0])?;
+            layer_out.push(h_states[0].clone());
+        }
+        layer_outputs.push(stack_outputs(&layer_out, seq_len, batch, self.hidden_size, input.device())?);
+        
+        // Layers 1..N
+        for layer in 1..self.num_layers {
+            let prev_output = &layer_outputs[layer - 1];
+            let mut layer_out = Vec::new();
+            
+            for t in 0..seq_len {
+                let x_t = get_timestep(prev_output, t)?;
+                let cell_idx = layer * num_directions;
+                h_states[cell_idx] = self.cells[cell_idx].forward(&x_t, &h_states[cell_idx])?;
+                layer_out.push(h_states[cell_idx].clone());
+            }
+            layer_outputs.push(stack_outputs(&layer_out, seq_len, batch, self.hidden_size, input.device())?);
+        }
+        
+        layer_outputs.pop().ok_or_else(|| ferrum_core::FerrumError::InvalidShape {
+            message: "No layers processed".to_string(),
+        })
     }
 
     fn parameters(&self) -> Vec<Tensor> {

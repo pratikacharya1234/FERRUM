@@ -1,7 +1,15 @@
 # Build artifacts
 /target/
+**/target/
 **/*.rs.bk
-Cargo.lock
+
+# Datasets (downloaded/extracted at runtime, never committed)
+/data/
+cifar-10-binary.tar.gz
+cifar-10-python.tar.gz
+
+# Distribution tarballs (built for Colab uploads)
+*.tar.gz
 
 # IDE
 .idea/

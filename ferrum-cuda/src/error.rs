@@ -6,7 +6,7 @@ use std::fmt;
 pub type CudaResult<T> = Result<T, CudaError>;
 
 /// CUDA-specific errors.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CudaError {
     /// CUDA is not available on this system.
     NotAvailable,
@@ -20,8 +20,9 @@ pub enum CudaError {
     InvalidMemoryAccess { address: usize },
     /// Synchronization failed.
     SyncFailed { message: String },
-    /// Driver error with code.
-    DriverError { code: i32, message: String },
+    /// Driver error with human-readable message.
+    /// The CUDA result code is embedded in the message for convenience.
+    DriverError { message: String },
     /// Stream error.
     StreamError { message: String },
     /// Invalid argument.
@@ -51,8 +52,8 @@ impl fmt::Display for CudaError {
             CudaError::SyncFailed { message } => {
                 write!(f, "CUDA synchronization failed: {}", message)
             }
-            CudaError::DriverError { code, message } => {
-                write!(f, "CUDA driver error ({}): {}", code, message)
+            CudaError::DriverError { message } => {
+                write!(f, "CUDA driver error: {}", message)
             }
             CudaError::StreamError { message } => {
                 write!(f, "CUDA stream error: {}", message)

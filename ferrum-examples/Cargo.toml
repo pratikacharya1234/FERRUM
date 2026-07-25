@@ -12,7 +12,11 @@ rust-version.workspace = true
 ferrum = { path = "../ferrum" }
 ferrum-autograd = { path = "../ferrum-autograd" }
 ferrum-optim = { path = "../ferrum-optim" }
+ferrum-nn = { path = "../ferrum-nn" }
+ferrum-data = { path = "../ferrum-data" }
+ferrum-cuda = { path = "../ferrum-cuda" }
 rand.workspace = true
+half.workspace = true
 
 [[example]]
 name = "simple_autograd"
@@ -41,3 +45,7 @@ path = "src/train_xor_simple.rs"
 [[example]]
 name = "new_features_demo"
 path = "src/new_features_demo.rs"
+
+[[example]]
+name = "bench"
+path = "src/bench.rs"

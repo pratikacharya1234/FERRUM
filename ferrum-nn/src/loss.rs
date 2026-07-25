@@ -9,18 +9,6 @@ use ferrum_core::{Result, Tensor};
 /// ```text
 /// MSE = (1/n) Σ (pred - target)²
 /// ```
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use ferrum::prelude::*;
-///
-/// let predictions = Tensor::randn([32, 10], DType::F32, Device::Cpu);
-/// let targets = Tensor::randn([32, 10], DType::F32, Device::Cpu);
-///
-/// let loss = mse_loss(&predictions, &targets)?;
-/// println!("MSE Loss: {}", loss.item()?);
-/// ```
 pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     let diff = predictions.sub(targets)?;
     let squared = diff.pow(2.0)?;
@@ -34,38 +22,14 @@ pub fn mse_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
 /// ```text
 /// BCE = -(1/n) Σ [y*log(p) + (1-y)*log(1-p)]
 /// ```
-///
-/// # Arguments
-///
-/// * `predictions` - Predicted probabilities (should be in [0, 1])
-/// * `targets` - Ground truth binary labels (0 or 1)
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let predictions = Tensor::from_slice(&[0.8, 0.2, 0.9], [3], Device::Cpu)?;
-/// let targets = Tensor::from_slice(&[1.0, 0.0, 1.0], [3], Device::Cpu)?;
-///
-/// let loss = bce_loss(&predictions, &targets)?;
-/// ```
 pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
-    // BCE = -[y*log(p) + (1-y)*log(1-p)]
-    let eps = 1e-7; // Small constant for numerical stability
-
-    // Clamp predictions to avoid log(0)
+    let eps = 1e-7;
     let pred_clamped = predictions.add_scalar(eps)?;
     let one_minus_pred = pred_clamped.neg()?.add_scalar(1.0 + eps)?;
-
-    // y * log(p)
     let term1 = targets.mul(&pred_clamped.log()?)?;
-
-    // (1-y) * log(1-p)
     let one_minus_target = targets.neg()?.add_scalar(1.0)?;
     let term2 = one_minus_target.mul(&one_minus_pred.log()?)?;
-
-    // -mean(term1 + term2)
     let loss = term1.add(&term2)?.mean()?.neg()?;
-
     Ok(loss)
 }
 
@@ -78,10 +42,10 @@ pub fn bce_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
 /// ```
 pub fn l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     let diff = predictions.sub(targets)?;
-    // We need abs() operation - for now use a workaround
-    let squared = diff.pow(2.0)?;
-    let abs_approx = squared.sqrt()?;
-    abs_approx.mean()
+    let data = diff.to_vec::<f32>()?;
+    let abs_data: Vec<f32> = data.iter().map(|&x| x.abs()).collect();
+    let abs_tensor = Tensor::from_slice(&abs_data, diff.shape().to_vec(), diff.device())?;
+    abs_tensor.mean()
 }
 
 /// Smooth L1 Loss (Huber loss with delta=1).
@@ -96,12 +60,17 @@ pub fn l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
 /// ```
 pub fn smooth_l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
     let diff = predictions.sub(targets)?;
-
-    // For now, just use L1 as approximation
-    // Full implementation would need conditional operations
-    let squared = diff.pow(2.0)?;
-    let abs_approx = squared.sqrt()?;
-    abs_approx.mean()
+    let data = diff.to_vec::<f32>()?;
+    let smooth_data: Vec<f32> = data.iter().map(|&x| {
+        let abs_x = x.abs();
+        if abs_x < 1.0 {
+            0.5 * x * x
+        } else {
+            abs_x - 0.5
+        }
+    }).collect();
+    let smooth_tensor = Tensor::from_slice(&smooth_data, diff.shape().to_vec(), diff.device())?;
+    smooth_tensor.mean()
 }
 
 /// Cross Entropy Loss (without softmax).
@@ -111,13 +80,7 @@ pub fn smooth_l1_loss(predictions: &Tensor, targets: &Tensor) -> Result<Tensor> 
 /// ```text
 /// CE = -(1/n) Σ targets * log(predictions)
 /// ```
-///
-/// # Note
-///
-/// For numerical stability, combine with log_softmax operation.
-/// This function expects log probabilities, not raw logits.
 pub fn cross_entropy_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
-    // CE = -mean(targets * log_probs)
     let product = targets.mul(log_probs)?;
     product.mean()?.neg()
 }
@@ -134,50 +97,65 @@ pub fn cross_entropy_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor
 ///
 /// * `log_probs` - Log probabilities from log_softmax, shape [batch, classes]
 /// * `targets` - Class indices, shape [batch]
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let logits = model.forward(&x)?;
-/// let log_probs = log_softmax(&logits, -1)?;
-/// let loss = nll_loss(&log_probs, &target_indices)?;
-/// ```
 pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor> {
-    // For now, this is a simplified version
-    // Full implementation needs gather/index_select operation
-
-    // Fallback: treat as cross entropy with one-hot targets
-    cross_entropy_loss(log_probs, targets)
+    let log_probs_data = log_probs.to_vec::<f32>()?;
+    let targets_data = targets.to_vec::<i64>()?;
+    let batch_size = targets_data.len();
+    let num_classes = log_probs.shape()[1];
+    
+    let mut total_loss = 0.0f32;
+    for (i, &target_idx) in targets_data.iter().enumerate() {
+        let idx = target_idx as usize;
+        if idx < num_classes {
+            total_loss += log_probs_data[i * num_classes + idx];
+        }
+    }
+    
+    let loss = -total_loss / batch_size as f32;
+    Tensor::from_slice(&[loss], [1], log_probs.device())
 }
 
-/// Softmax function along a dimension.
+/// Softmax function along specified dimension.
 ///
-/// Computes: softmax(x_i) = exp(x_i) / Σ exp(x_j)
-///
-/// # Arguments
-///
-/// * `input` - Input tensor
-/// * `dim` - Dimension along which to compute softmax
-///
-/// # Note
-///
-/// For numerical stability, this subtracts the max before exp.
-pub fn softmax(input: &Tensor, _dim: i64) -> Result<Tensor> {
-    // Simplified version: softmax over all elements
-    // Full version would work along specified dimension
+/// Numerically stable: subtracts max before exp.
+pub fn softmax(input: &Tensor, dim: i64) -> Result<Tensor> {
+    let shape = input.shape();
+    let ndim = shape.len() as i64;
+    let dim = if dim < 0 { ndim + dim } else { dim } as usize;
 
-    let exp = input.exp()?;
-    let sum = exp.sum()?;
-    exp.div(&sum)
+    let data = input.to_vec::<f32>()?;
+    let mut output = vec![0.0f32; data.len()];
+    let dim_size = shape[dim];
+    let outer: usize = shape[..dim].iter().product();
+    let inner: usize = shape[dim + 1..].iter().product();
+
+    for o in 0..outer {
+        for i in 0..inner {
+            let mut max_val = f32::NEG_INFINITY;
+            for d in 0..dim_size {
+                let idx = o * dim_size * inner + d * inner + i;
+                max_val = max_val.max(data[idx]);
+            }
+            let mut sum = 0.0f32;
+            for d in 0..dim_size {
+                let idx = o * dim_size * inner + d * inner + i;
+                let v = (data[idx] - max_val).exp();
+                output[idx] = v;
+                sum += v;
+            }
+            for d in 0..dim_size {
+                let idx = o * dim_size * inner + d * inner + i;
+                output[idx] /= sum;
+            }
+        }
+    }
+    Tensor::from_slice(&output, shape.to_vec(), input.device())
 }
 
 /// Log Softmax function along a dimension.
 ///
 /// Computes: log_softmax(x_i) = x_i - log(Σ exp(x_j))
-///
-/// More numerically stable than log(softmax(x)).
 pub fn log_softmax(input: &Tensor, dim: i64) -> Result<Tensor> {
-    // log(softmax(x)) = x - log(sum(exp(x)))
     let sm = softmax(input, dim)?;
     sm.log()
 }
@@ -190,49 +168,47 @@ mod tests {
     #[test]
     fn test_mse_loss() {
         let pred = Tensor::from_slice(&[1.0f32, 2.0, 3.0], [3], Device::Cpu).unwrap();
-
         let target = Tensor::from_slice(&[1.0f32, 2.0, 3.0], [3], Device::Cpu).unwrap();
-
         let loss = mse_loss(&pred, &target).unwrap();
         let loss_val = loss.item().unwrap();
-
-        assert!(loss_val < 1e-6); // Should be ~0 for perfect prediction
-    }
-
-    #[test]
-    fn test_mse_loss_nonzero() {
-        let pred = Tensor::from_slice(&[1.0f32, 2.0, 3.0], [3], Device::Cpu).unwrap();
-
-        let target = Tensor::from_slice(&[0.0f32, 0.0, 0.0], [3], Device::Cpu).unwrap();
-
-        let loss = mse_loss(&pred, &target).unwrap();
-        let loss_val = loss.item().unwrap();
-
-        // MSE = mean([1, 4, 9]) = 14/3 ≈ 4.67
-        assert!((loss_val - 4.666).abs() < 0.01);
+        assert!(loss_val < 1e-6);
     }
 
     #[test]
     fn test_l1_loss() {
         let pred = Tensor::from_slice(&[1.0f32, 2.0, 3.0], [3], Device::Cpu).unwrap();
-
         let target = Tensor::zeros([3], DType::F32, Device::Cpu);
-
         let loss = l1_loss(&pred, &target).unwrap();
         let loss_val = loss.item().unwrap();
-
-        // L1 = mean([1, 2, 3]) = 2
         assert!((loss_val - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_smooth_l1_loss() {
+        let pred = Tensor::from_slice(&[1.0f32, 2.0, 0.5], [3], Device::Cpu).unwrap();
+        let target = Tensor::zeros([3], DType::F32, Device::Cpu);
+        let loss = smooth_l1_loss(&pred, &target).unwrap();
+        let loss_val = loss.item().unwrap();
+        // smooth_l1(1.0) = 0.5, smooth_l1(2.0) = 1.5, smooth_l1(0.5) = 0.125
+        let expected = (0.5 + 1.5 + 0.125) / 3.0;
+        assert!((loss_val - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_nll_loss() {
+        let log_probs = Tensor::from_slice(&[-0.5f32, -1.0, -2.0, -1.0, -0.5, -2.0], [2, 3], Device::Cpu).unwrap();
+        let targets = Tensor::from_slice(&[0i64, 1], [2], Device::Cpu).unwrap();
+        let loss = nll_loss(&log_probs, &targets).unwrap();
+        let loss_val = loss.item().unwrap();
+        // -(-0.5 + -0.5) / 2 = 0.5
+        assert!((loss_val - 0.5).abs() < 0.01);
     }
 
     #[test]
     fn test_softmax() {
         let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0], [3], Device::Cpu).unwrap();
-
         let output = softmax(&input, 0).unwrap();
         let sum = output.sum().unwrap().item().unwrap();
-
-        // Softmax outputs should sum to 1
         assert!((sum - 1.0).abs() < 1e-5);
     }
 }

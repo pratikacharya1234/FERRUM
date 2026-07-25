@@ -21,6 +21,22 @@ pub enum DistributedError {
     #[error("Communication error: {0}")]
     CommunicationError(String),
 
+    /// Communication failed.
+    #[error("Communication failed: {0}")]
+    CommunicationFailed(String),
+
+    /// Connection failed.
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+
+    /// Send failed.
+    #[error("Send failed: {0}")]
+    SendFailed(String),
+
+    /// Receive failed.
+    #[error("Receive failed: {0}")]
+    RecvFailed(String),
+
     /// Timeout during collective operation.
     #[error("Timeout during {0}")]
     Timeout(String),

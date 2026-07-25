@@ -5,7 +5,7 @@ use ferrum_core::{DType, Device, Result, Tensor};
 use crate::init;
 use crate::module::Module;
 
-/// Linear layer: y = xW^T + b
+/// Linear layer: y = xW + b
 ///
 /// # Example
 ///
@@ -14,7 +14,12 @@ use crate::module::Module;
 /// let output = linear.forward(&input)?;  // [batch, 784] -> [batch, 256]
 /// ```
 pub struct Linear {
-    /// Weight matrix [out_features, in_features]
+    /// Weight matrix [in_features, out_features].
+    ///
+    /// Stored input-major so forward is `input.matmul(&weight)` directly.
+    /// Autograd tracks gradients by tensor id, and transposed views share
+    /// their base tensor's id, so a `weight.t()` in forward would deposit a
+    /// transposed gradient on `weight` — this layout avoids that entirely.
     weight: Tensor,
     /// Optional bias [out_features]
     bias: Option<Tensor>,
@@ -36,7 +41,7 @@ impl Linear {
     pub fn with_bias(in_features: usize, out_features: usize, bias: bool) -> Self {
         // Kaiming uniform initialization (He initialization)
         let weight = init::kaiming_uniform(
-            &[out_features, in_features],
+            &[in_features, out_features],
             in_features,
             DType::F32,
             Device::Cpu,
@@ -63,6 +68,19 @@ impl Linear {
         }
     }
 
+    /// Move the layer's parameters to a device.
+    ///
+    /// Call before handing `parameters()` to an optimizer — the optimizer
+    /// shares storage with the tensors it is given, so parameters moved
+    /// afterwards would leave the optimizer updating the old copies.
+    pub fn to_device(&mut self, device: Device) -> Result<()> {
+        self.weight = self.weight.to_device(device)?;
+        if let Some(bias) = self.bias.take() {
+            self.bias = Some(bias.to_device(device)?);
+        }
+        Ok(())
+    }
+
     /// Get input features.
     pub fn in_features(&self) -> usize {
         self.in_features
@@ -77,9 +95,9 @@ impl Linear {
 impl Module for Linear {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         // input: [batch, in_features]
-        // weight: [out_features, in_features]
-        // output = input @ weight.T + bias
-        let output = input.matmul(&self.weight.t()?)?;
+        // weight: [in_features, out_features]
+        // output = input @ weight + bias
+        let output = input.matmul(&self.weight)?;
 
         if let Some(ref bias) = self.bias {
             output.add(bias)

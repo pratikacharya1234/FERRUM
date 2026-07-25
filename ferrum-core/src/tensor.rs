@@ -212,6 +212,29 @@ impl Tensor {
         let shape = shape.into();
         let _numel = shape.numel();
 
+        #[cfg(feature = "cuda")]
+        if device.is_cuda() {
+            // Sample on the host, then upload: device storage cannot be
+            // written through host slices.
+            let mut rng = rand::thread_rng();
+            let dist = StandardNormal;
+            return match dtype {
+                DType::F32 => {
+                    let data: Vec<f32> =
+                        (0..shape.numel()).map(|_| dist.sample(&mut rng)).collect();
+                    Self::from_slice(&data, shape, device)
+                        .expect("CUDA randn upload failed")
+                }
+                DType::F64 => {
+                    let data: Vec<f64> =
+                        (0..shape.numel()).map(|_| dist.sample(&mut rng)).collect();
+                    Self::from_slice(&data, shape, device)
+                        .expect("CUDA randn upload failed")
+                }
+                _ => panic!("randn only supports floating point dtypes, got {:?}", dtype),
+            };
+        }
+
         let tensor = Self::zeros(shape, dtype, device);
         let mut rng = rand::thread_rng();
 
@@ -247,6 +270,29 @@ impl Tensor {
         device: Device,
     ) -> Self {
         let shape = shape.into();
+
+        #[cfg(feature = "cuda")]
+        if device.is_cuda() {
+            let mut rng = rand::thread_rng();
+            return match dtype {
+                DType::F32 => {
+                    let dist = Normal::new(mean as f32, std as f32).unwrap();
+                    let data: Vec<f32> =
+                        (0..shape.numel()).map(|_| dist.sample(&mut rng)).collect();
+                    Self::from_slice(&data, shape, device)
+                        .expect("CUDA normal upload failed")
+                }
+                DType::F64 => {
+                    let dist = Normal::new(mean, std).unwrap();
+                    let data: Vec<f64> =
+                        (0..shape.numel()).map(|_| dist.sample(&mut rng)).collect();
+                    Self::from_slice(&data, shape, device)
+                        .expect("CUDA normal upload failed")
+                }
+                _ => panic!("normal only supports floating point dtypes, got {:?}", dtype),
+            };
+        }
+
         let tensor = Self::zeros(shape, dtype, device);
         let mut rng = rand::thread_rng();
 
@@ -285,6 +331,29 @@ impl Tensor {
         device: Device,
     ) -> Self {
         let shape = shape.into();
+
+        #[cfg(feature = "cuda")]
+        if device.is_cuda() {
+            let mut rng = rand::thread_rng();
+            return match dtype {
+                DType::F32 => {
+                    let dist = Uniform::new(low as f32, high as f32);
+                    let data: Vec<f32> =
+                        (0..shape.numel()).map(|_| dist.sample(&mut rng)).collect();
+                    Self::from_slice(&data, shape, device)
+                        .expect("CUDA uniform upload failed")
+                }
+                DType::F64 => {
+                    let dist = Uniform::new(low, high);
+                    let data: Vec<f64> =
+                        (0..shape.numel()).map(|_| dist.sample(&mut rng)).collect();
+                    Self::from_slice(&data, shape, device)
+                        .expect("CUDA uniform upload failed")
+                }
+                _ => panic!("uniform on CUDA supports floating point dtypes, got {:?}", dtype),
+            };
+        }
+
         let tensor = Self::zeros(shape, dtype, device);
         let mut rng = rand::thread_rng();
 
@@ -833,6 +902,14 @@ impl Tensor {
             return Ok(self.clone());
         }
 
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let mut new_tensor = self.cuda_materialize_contiguous()?;
+            new_tensor.requires_grad = self.requires_grad;
+            new_tensor.grad = self.grad.clone();
+            return Ok(new_tensor);
+        }
+
         // Need to copy data to new contiguous storage
         let mut new_tensor = unsafe { Self::uninit(self.shape.clone(), self.dtype, self.device) };
 
@@ -843,6 +920,311 @@ impl Tensor {
         new_tensor.grad = self.grad.clone();
 
         Ok(new_tensor)
+    }
+
+    // ========================================================================
+    // CUDA DISPATCH
+    //
+    // Every compute op checks `device.is_cuda()` at its entry and routes
+    // here. These helpers either run the op on the registered GPU backend
+    // or fail loudly — there is deliberately no silent CPU fallback for
+    // CUDA tensors.
+    // ========================================================================
+
+    /// The registered GPU backend, or a loud error telling the user how
+    /// to get one.
+    #[cfg(feature = "cuda")]
+    fn gpu_backend(op: &'static str) -> Result<&'static dyn crate::gpu::GpuBackend> {
+        crate::gpu::backend().ok_or_else(|| FerrumError::NotImplemented {
+            feature: format!(
+                "CUDA dispatch for '{op}': no GPU backend registered \
+                 (call ferrum_cuda::register_gpu_backend() at startup)"
+            ),
+        })
+    }
+
+    /// Guard: GPU compute is implemented for F32 only.
+    #[cfg(feature = "cuda")]
+    fn cuda_f32_only(&self, op: &'static str) -> Result<()> {
+        if self.dtype != DType::F32 {
+            return Err(FerrumError::NotImplemented {
+                feature: format!(
+                    "CUDA dispatch not implemented for '{op}' with dtype {:?} (F32 only)",
+                    self.dtype
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Device address of this tensor's first element (offset applied).
+    #[cfg(feature = "cuda")]
+    fn cuda_elem_ptr(&self) -> u64 {
+        self.storage.device_ptr() + (self.offset * self.dtype.size_of()) as u64
+    }
+
+    /// Strides of `self` broadcast against `target_dims`, derived from the
+    /// tensor's *actual* strides (stride 0 on broadcast dimensions).
+    fn broadcast_view_strides(
+        &self,
+        target_dims: &[usize],
+    ) -> Result<SmallVec<[usize; MAX_INLINE_DIMS]>> {
+        let src_dims = self.shape.dims();
+        if src_dims.len() > target_dims.len() {
+            return Err(FerrumError::BroadcastError {
+                lhs: Box::new(self.shape.clone()),
+                rhs: Box::new(Shape::from(target_dims.to_vec())),
+            });
+        }
+        let pad = target_dims.len() - src_dims.len();
+        let mut out: SmallVec<[usize; MAX_INLINE_DIMS]> =
+            SmallVec::with_capacity(target_dims.len());
+        for _ in 0..pad {
+            out.push(0);
+        }
+        for i in 0..src_dims.len() {
+            if src_dims[i] == target_dims[pad + i] {
+                out.push(self.strides[i]);
+            } else if src_dims[i] == 1 {
+                out.push(0);
+            } else {
+                return Err(FerrumError::BroadcastError {
+                    lhs: Box::new(self.shape.clone()),
+                    rhs: Box::new(Shape::from(target_dims.to_vec())),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Materialize a non-contiguous CUDA view into contiguous storage.
+    #[cfg(feature = "cuda")]
+    fn cuda_materialize_contiguous(&self) -> Result<Self> {
+        self.cuda_f32_only("contiguous")?;
+        let backend = Self::gpu_backend("contiguous")?;
+        let result = Self::zeros(self.shape.clone(), self.dtype, self.device);
+        backend
+            .copy_strided_f32(
+                self.cuda_elem_ptr(),
+                result.cuda_elem_ptr(),
+                self.shape.dims(),
+                &self.strides,
+            )
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA contiguous failed: {e}"),
+            })?;
+        Ok(result)
+    }
+
+    /// Element-wise binary op (with broadcasting) on the GPU.
+    #[cfg(feature = "cuda")]
+    fn cuda_binary(&self, other: &Tensor, op_name: &'static str) -> Result<Self> {
+        use crate::gpu::GpuBinaryOp;
+        let op = match op_name {
+            "add" => GpuBinaryOp::Add,
+            "sub" => GpuBinaryOp::Sub,
+            "mul" => GpuBinaryOp::Mul,
+            "div" => GpuBinaryOp::Div,
+            _ => {
+                return Err(FerrumError::NotImplemented {
+                    feature: format!("CUDA dispatch not implemented for '{op_name}'"),
+                })
+            }
+        };
+        self.cuda_f32_only(op_name)?;
+        let backend = Self::gpu_backend(op_name)?;
+
+        let result_shape = Shape::broadcast(&self.shape, &other.shape)?;
+        let dims = result_shape.dims().to_vec();
+        let a_strides = self.broadcast_view_strides(&dims)?;
+        let b_strides = other.broadcast_view_strides(&dims)?;
+
+        let result = Self::zeros(result_shape, self.dtype, self.device);
+        backend
+            .binary_f32(
+                self.cuda_elem_ptr(),
+                other.cuda_elem_ptr(),
+                result.cuda_elem_ptr(),
+                &dims,
+                &a_strides,
+                &b_strides,
+                op,
+            )
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA {op_name} failed: {e}"),
+            })?;
+        Ok(result)
+    }
+
+    /// Element-wise unary op on the GPU.
+    #[cfg(feature = "cuda")]
+    fn cuda_unary(&self, op_name: &'static str) -> Result<Self> {
+        use crate::gpu::GpuUnaryOp;
+        let op = match op_name {
+            "neg" => GpuUnaryOp::Neg,
+            "exp" => GpuUnaryOp::Exp,
+            "log" => GpuUnaryOp::Log,
+            "sqrt" => GpuUnaryOp::Sqrt,
+            "abs" => GpuUnaryOp::Abs,
+            "relu" => GpuUnaryOp::Relu,
+            "sigmoid" => GpuUnaryOp::Sigmoid,
+            "tanh" => GpuUnaryOp::Tanh,
+            _ => {
+                return Err(FerrumError::NotImplemented {
+                    feature: format!("CUDA dispatch not implemented for '{op_name}'"),
+                })
+            }
+        };
+        self.cuda_f32_only(op_name)?;
+        let backend = Self::gpu_backend(op_name)?;
+
+        let input = self.contiguous()?;
+        let result = Self::zeros(self.shape.clone(), self.dtype, self.device);
+        backend
+            .unary_f32(
+                input.cuda_elem_ptr(),
+                result.cuda_elem_ptr(),
+                input.numel(),
+                op,
+            )
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA {op_name} failed: {e}"),
+            })?;
+        Ok(result)
+    }
+
+    /// Element-wise scalar op on the GPU.
+    #[cfg(feature = "cuda")]
+    fn cuda_scalar(&self, scalar: f64, op: crate::gpu::GpuScalarOp) -> Result<Self> {
+        self.cuda_f32_only("scalar op")?;
+        let backend = Self::gpu_backend("scalar op")?;
+
+        let input = self.contiguous()?;
+        let result = Self::zeros(self.shape.clone(), self.dtype, self.device);
+        backend
+            .scalar_f32(
+                input.cuda_elem_ptr(),
+                result.cuda_elem_ptr(),
+                input.numel(),
+                scalar as f32,
+                op,
+            )
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA scalar op failed: {e}"),
+            })?;
+        Ok(result)
+    }
+
+    /// Global sum on the GPU, into a scalar tensor. `divisor` turns the
+    /// sum into a mean when set.
+    #[cfg(feature = "cuda")]
+    fn cuda_reduce_all(&self, op_name: &'static str, divisor: Option<f64>) -> Result<Self> {
+        self.cuda_f32_only(op_name)?;
+        let backend = Self::gpu_backend(op_name)?;
+
+        let input = self.contiguous()?;
+        let result = Self::zeros(Shape::scalar(), self.dtype, self.device);
+        backend
+            .reduce_sum_f32(input.cuda_elem_ptr(), result.cuda_elem_ptr(), input.numel())
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA {op_name} failed: {e}"),
+            })?;
+        if let Some(d) = divisor {
+            backend
+                .scalar_f32(
+                    result.cuda_elem_ptr(),
+                    result.cuda_elem_ptr(),
+                    1,
+                    d as f32,
+                    crate::gpu::GpuScalarOp::Div,
+                )
+                .map_err(|e| FerrumError::InternalError {
+                    message: format!("CUDA {op_name} failed: {e}"),
+                })?;
+        }
+        Ok(result)
+    }
+
+    /// Sum along an axis on the GPU. Input decomposed as [pre, axis, post].
+    #[cfg(feature = "cuda")]
+    fn cuda_sum_dim(
+        &self,
+        new_shape: Shape,
+        pre: usize,
+        axis_size: usize,
+        post: usize,
+    ) -> Result<Self> {
+        self.cuda_f32_only("sum_dim")?;
+        let backend = Self::gpu_backend("sum_dim")?;
+
+        let input = self.contiguous()?;
+        let result = Self::zeros(new_shape, self.dtype, self.device);
+        backend
+            .reduce_sum_dim_f32(
+                input.cuda_elem_ptr(),
+                result.cuda_elem_ptr(),
+                pre,
+                axis_size,
+                post,
+            )
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA sum_dim failed: {e}"),
+            })?;
+        Ok(result)
+    }
+
+    /// 2-D matmul on the GPU via the backend (cuBLAS).
+    #[cfg(feature = "cuda")]
+    fn cuda_matmul_2d(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Result<Self> {
+        self.cuda_f32_only("matmul")?;
+        let backend = Self::gpu_backend("matmul")?;
+
+        let a = self.contiguous()?;
+        let b = other.contiguous()?;
+        let result = Self::zeros([m, n], self.dtype, self.device);
+        backend
+            .matmul_f32(
+                a.cuda_elem_ptr(),
+                b.cuda_elem_ptr(),
+                result.cuda_elem_ptr(),
+                m,
+                k,
+                n,
+            )
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA matmul failed: {e}"),
+            })?;
+        Ok(result)
+    }
+
+    /// In-place element-wise update on the GPU: `self = self OP other`.
+    /// `self` must be contiguous (parameters and gradients are).
+    #[cfg(feature = "cuda")]
+    fn cuda_binary_inplace(&self, other: &Tensor, op: crate::gpu::GpuBinaryOp) -> Result<()> {
+        self.cuda_f32_only("in-place op")?;
+        let backend = Self::gpu_backend("in-place op")?;
+        if !self.is_contiguous() {
+            return Err(FerrumError::NotImplemented {
+                feature: "CUDA in-place op on non-contiguous tensor".to_string(),
+            });
+        }
+
+        let dims = self.shape.dims().to_vec();
+        let self_strides = self.strides.clone();
+        let other_strides = other.broadcast_view_strides(&dims)?;
+        backend
+            .binary_f32(
+                self.cuda_elem_ptr(),
+                other.cuda_elem_ptr(),
+                self.cuda_elem_ptr(),
+                &dims,
+                &self_strides,
+                &other_strides,
+                op,
+            )
+            .map_err(|e| FerrumError::InternalError {
+                message: format!("CUDA in-place op failed: {e}"),
+            })
     }
 
     /// Copy data to a contiguous tensor (helper).
@@ -1019,7 +1401,12 @@ impl Tensor {
     /// Expand tensor to a larger size (broadcasting).
     pub fn expand(&self, new_shape: impl Into<Shape>) -> Result<Self> {
         let new_shape = new_shape.into();
-        let new_strides = self.shape.broadcast_strides(&new_shape)?;
+
+        // Broadcast strides must come from this tensor's actual strides, not
+        // from the shape's contiguous layout: `self` may already be a view
+        // (e.g. a previous expand with stride 0), and assuming contiguity
+        // here produces strides that index past the underlying storage.
+        let new_strides = self.broadcast_view_strides(new_shape.dims())?;
 
         Ok(Self {
             storage: self.storage.clone(),
@@ -1096,6 +1483,23 @@ impl Tensor {
             });
         }
 
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let elem = self.dtype.size_of();
+            let mut bytes = vec![0u8; elem];
+            self.storage.copy_to_host(&mut bytes, self.offset * elem)?;
+            return match self.dtype {
+                DType::F32 => Ok(f32::from_le_bytes(bytes.try_into().unwrap()) as f64),
+                DType::F64 => Ok(f64::from_le_bytes(bytes.try_into().unwrap())),
+                DType::I32 => Ok(i32::from_le_bytes(bytes.try_into().unwrap()) as f64),
+                DType::I64 => Ok(i64::from_le_bytes(bytes.try_into().unwrap()) as f64),
+                _ => Err(FerrumError::not_implemented(format!(
+                    "item() for {:?}",
+                    self.dtype
+                ))),
+            };
+        }
+
         match self.dtype {
             DType::F32 => {
                 let data = self.storage.read_as::<f32>();
@@ -1131,12 +1535,41 @@ impl Tensor {
         }
 
         let contiguous = self.contiguous()?;
+
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let elem = std::mem::size_of::<T>();
+            let mut out = vec![T::zeroed(); contiguous.numel()];
+            let bytes = bytemuck::cast_slice_mut(&mut out);
+            contiguous
+                .storage
+                .copy_to_host(bytes, contiguous.offset * elem)?;
+            return Ok(out);
+        }
+
         let data = contiguous.storage.read_as::<T>();
         Ok(data.as_slice()[contiguous.offset..contiguous.offset + contiguous.numel()].to_vec())
     }
 
     /// Fill tensor with a scalar value.
     fn fill_scalar(&mut self, value: f64) {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            // Build the fill on the host and upload; a fill kernel is not
+            // worth the plumbing for constructor-time initialization.
+            let bytes: Vec<u8> = match self.dtype {
+                DType::F32 => bytemuck::cast_slice(&vec![value as f32; self.numel()]).to_vec(),
+                DType::F64 => bytemuck::cast_slice(&vec![value; self.numel()]).to_vec(),
+                DType::I32 => bytemuck::cast_slice(&vec![value as i32; self.numel()]).to_vec(),
+                DType::I64 => bytemuck::cast_slice(&vec![value as i64; self.numel()]).to_vec(),
+                _ => panic!("fill_scalar not supported for {:?}", self.dtype),
+            };
+            self.storage
+                .copy_from_host(&bytes, self.offset * self.dtype.size_of())
+                .expect("CUDA fill_scalar upload failed");
+            return;
+        }
+
         match self.dtype {
             DType::F32 => {
                 let mut data = self.storage.write_as::<f32>();
@@ -1227,16 +1660,62 @@ impl Tensor {
             return Ok(self.clone());
         }
 
-        // For now, only CPU is supported
-        if !device.is_cpu() {
-            return Err(FerrumError::not_implemented(format!(
-                "Device transfer to {:?}",
-                device
-            )));
+        // CPU to CPU is a no-op
+        if self.device.is_cpu() && device.is_cpu() {
+            return Ok(self.clone());
         }
 
-        // CPU to CPU is a no-op
-        Ok(self.clone())
+        // CPU to CUDA: upload (cuMemAlloc happens inside Storage::uninit,
+        // the copy is cuMemcpyHtoD via Storage::copy_from_host).
+        if self.device.is_cpu() && device.is_cuda() {
+            let src = self.contiguous()?;
+            let elem = src.dtype.size_of();
+            let nbytes = src.numel() * elem;
+
+            let mut new_tensor = unsafe { Self::uninit(src.shape.clone(), src.dtype, device) };
+            {
+                let data = src.storage.read_as::<u8>();
+                let start = src.offset * elem;
+                new_tensor
+                    .storage
+                    .copy_from_host(&data.as_slice()[start..start + nbytes], 0)?;
+            }
+            new_tensor.requires_grad = self.requires_grad;
+            if self.requires_grad {
+                new_tensor = new_tensor.with_requires_grad(true);
+            }
+            return Ok(new_tensor);
+        }
+
+        // CUDA to CPU: download via cuMemcpyDtoH.
+        if self.device.is_cuda() && device.is_cpu() {
+            let src = self.contiguous()?;
+            let elem = src.dtype.size_of();
+            let nbytes = src.numel() * elem;
+
+            let mut bytes = vec![0u8; nbytes];
+            src.storage.copy_to_host(&mut bytes, src.offset * elem)?;
+
+            let mut new_tensor = unsafe { Self::uninit(src.shape.clone(), src.dtype, Device::Cpu) };
+            new_tensor.storage.copy_from_host(&bytes, 0)?;
+            new_tensor.requires_grad = self.requires_grad;
+            if self.requires_grad {
+                new_tensor = new_tensor.with_requires_grad(true);
+            }
+            return Ok(new_tensor);
+        }
+
+        // CUDA to CUDA across devices is not supported yet.
+        if self.device.is_cuda() && device.is_cuda() {
+            return Err(FerrumError::not_implemented(
+                "peer-to-peer CUDA device transfer",
+            ));
+        }
+
+        Err(FerrumError::not_implemented(format!(
+            "Device transfer from {:?} to {:?}",
+            self.device, device
+        )))
     }
 
     // ========================================================================
@@ -1356,13 +1835,18 @@ impl Tensor {
             });
         }
 
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            return self.cuda_binary_inplace(other, crate::gpu::GpuBinaryOp::Sub);
+        }
+
         let other_contiguous = other.contiguous()?;
 
         match self.dtype {
             DType::F32 => {
                 let mut self_data = self.storage.write_as::<f32>();
                 let other_data = other_contiguous.storage.read_as::<f32>();
-                
+
                 for (s, o) in self_data.as_mut_slice().iter_mut().zip(other_data.as_slice().iter()) {
                     *s -= *o;
                 }
@@ -1407,13 +1891,18 @@ impl Tensor {
             });
         }
 
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            return self.cuda_binary_inplace(other, crate::gpu::GpuBinaryOp::Add);
+        }
+
         let other_contiguous = other.contiguous()?;
 
         match self.dtype {
             DType::F32 => {
                 let mut self_data = self.storage.write_as::<f32>();
                 let other_data = other_contiguous.storage.read_as::<f32>();
-                
+
                 for (s, o) in self_data.as_mut_slice().iter_mut().zip(other_data.as_slice().iter()) {
                     *s += *o;
                 }
@@ -1439,6 +1928,28 @@ impl Tensor {
 
     /// In-place scalar multiplication: self = self * scalar
     pub fn mul_scalar_inplace(&self, scalar: f64) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            self.cuda_f32_only("mul_scalar_inplace")?;
+            let backend = Self::gpu_backend("mul_scalar_inplace")?;
+            if !self.is_contiguous() {
+                return Err(FerrumError::NotImplemented {
+                    feature: "CUDA in-place op on non-contiguous tensor".to_string(),
+                });
+            }
+            return backend
+                .scalar_f32(
+                    self.cuda_elem_ptr(),
+                    self.cuda_elem_ptr(),
+                    self.numel(),
+                    scalar as f32,
+                    crate::gpu::GpuScalarOp::Mul,
+                )
+                .map_err(|e| FerrumError::InternalError {
+                    message: format!("CUDA mul_scalar_inplace failed: {e}"),
+                });
+        }
+
         match self.dtype {
             DType::F32 => {
                 let mut self_data = self.storage.write_as::<f32>();
@@ -1490,6 +2001,13 @@ impl Tensor {
                 expected: self.dtype,
                 actual: other.dtype,
             });
+        }
+
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let mut result = self.cuda_binary(other, op_name)?;
+            result.requires_grad = self.requires_grad || other.requires_grad;
+            return Ok(result);
         }
 
         // Calculate broadcast shape
@@ -1559,6 +2077,25 @@ impl Tensor {
         F32Op: Fn(f32, f32) -> f32,
         F64Op: Fn(f64, f64) -> f64,
     {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            use crate::gpu::GpuScalarOp;
+            let op = match op_name {
+                "add_scalar" => GpuScalarOp::Add,
+                "sub_scalar" => GpuScalarOp::Sub,
+                "mul_scalar" => GpuScalarOp::Mul,
+                "div_scalar" => GpuScalarOp::Div,
+                _ => {
+                    return Err(FerrumError::NotImplemented {
+                        feature: format!("CUDA dispatch not implemented for '{op_name}'"),
+                    })
+                }
+            };
+            let mut result = self.cuda_scalar(scalar, op)?;
+            result.requires_grad = self.requires_grad;
+            return Ok(result);
+        }
+
         let mut result = Self::zeros(self.shape.clone(), self.dtype, self.device);
         let contiguous = self.contiguous()?;
 
@@ -1609,6 +2146,23 @@ impl Tensor {
 
     /// Sum all elements with automatic differentiation.
     pub fn sum(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let mut result = self.cuda_reduce_all("sum", None)?;
+            result.requires_grad = self.requires_grad;
+            if self.requires_grad && autograd_ops::is_autograd_enabled() {
+                autograd_ops::record_operation(
+                    Box::new(autograd_ops::SumBackward {
+                        input_shape: self.shape.clone(),
+                    }),
+                    &[self.tensor_id],
+                    result.tensor_id,
+                    vec![],
+                );
+            }
+            return Ok(result);
+        }
+
         let contiguous = self.contiguous()?;
         let mut result = Self::zeros(Shape::scalar(), self.dtype, self.device);
 
@@ -1650,6 +2204,23 @@ impl Tensor {
 
     /// Mean of all elements with automatic differentiation.
     pub fn mean(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let mut result = self.cuda_reduce_all("mean", Some(self.numel() as f64))?;
+            result.requires_grad = self.requires_grad;
+            if self.requires_grad && autograd_ops::is_autograd_enabled() {
+                autograd_ops::record_operation(
+                    Box::new(autograd_ops::MeanBackward {
+                        input_shape: self.shape.clone(),
+                    }),
+                    &[self.tensor_id],
+                    result.tensor_id,
+                    vec![],
+                );
+            }
+            return Ok(result);
+        }
+
         let contiguous = self.contiguous()?;
         let n = self.numel() as f64;
         let mut result = Self::zeros(Shape::scalar(), self.dtype, self.device);
@@ -1731,7 +2302,27 @@ impl Tensor {
         let post_axis_size: usize = shape[axis + 1..].iter().product();
         let pre_axis_size = if pre_axis_size == 0 { 1 } else { pre_axis_size };
         let post_axis_size = if post_axis_size == 0 { 1 } else { post_axis_size };
-        
+
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let mut result =
+                self.cuda_sum_dim(new_shape, pre_axis_size, axis_size, post_axis_size)?;
+            result.requires_grad = self.requires_grad;
+            if self.requires_grad && autograd_ops::is_autograd_enabled() {
+                autograd_ops::record_operation(
+                    Box::new(autograd_ops::SumDimBackward {
+                        input_shape: self.shape.clone(),
+                        dim: axis,
+                        keepdim,
+                    }),
+                    &[self.tensor_id],
+                    result.tensor_id,
+                    vec![],
+                );
+            }
+            return Ok(result);
+        }
+
         let mut result = Self::zeros(new_shape.clone(), self.dtype, self.device);
         
         match self.dtype {
@@ -2244,6 +2835,22 @@ impl Tensor {
 
     /// Element-wise power with automatic differentiation.
     pub fn pow(&self, exponent: f64) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let result = self.cuda_scalar(exponent, crate::gpu::GpuScalarOp::Pow)?;
+            let mut result = result;
+            result.requires_grad = self.requires_grad;
+            if self.requires_grad && autograd_ops::is_autograd_enabled() {
+                autograd_ops::record_operation(
+                    Box::new(autograd_ops::PowBackward { exponent }),
+                    &[self.tensor_id],
+                    result.tensor_id,
+                    vec![self.clone()],
+                );
+            }
+            return Ok(result);
+        }
+
         let mut result = Self::zeros(self.shape.clone(), self.dtype, self.device);
         let contiguous = self.contiguous()?;
 
@@ -2336,6 +2943,13 @@ impl Tensor {
         F32Op: Fn(f32) -> f32,
         F64Op: Fn(f64) -> f64,
     {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let mut result = self.cuda_unary(op_name)?;
+            result.requires_grad = self.requires_grad;
+            return Ok(result);
+        }
+
         let mut result = Self::zeros(self.shape.clone(), self.dtype, self.device);
         let contiguous = self.contiguous()?;
 
@@ -2506,6 +3120,13 @@ impl Tensor {
                 format!("[{}, K] @ [K, {}]", m, n),
                 format!("[{}, {}] @ [{}, {}]", m, k, b_shape[0], n),
             ));
+        }
+
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() {
+            let mut result = self.cuda_matmul_2d(other, m, k, n)?;
+            result.requires_grad = self.requires_grad || other.requires_grad;
+            return Ok(result);
         }
 
         let mut result = Self::zeros([m, n], self.dtype, self.device);

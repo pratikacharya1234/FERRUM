@@ -1,6 +1,6 @@
 //! Data transforms for preprocessing.
 
-use ferrum_core::{Result, Tensor};
+use ferrum_core::{DType, Result, Tensor};
 
 /// A transform that can be applied to data.
 pub trait Transform: Send + Sync {
@@ -48,9 +48,22 @@ impl Normalize {
     }
 
     /// ImageNet normalization for RGB images.
+    /// Uses per-channel mean and std computed from ImageNet dataset.
     pub fn imagenet() -> Self {
-        // Approximate ImageNet normalization
-        Self::new(0.485, 0.229)
+        // Full ImageNet normalization: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        // For single-channel or general use, use mean of channels
+        let mean = (0.485 + 0.456 + 0.406) / 3.0;
+        let std = (0.229 + 0.224 + 0.225) / 3.0;
+        Self::new(mean, std)
+    }
+
+    /// ImageNet normalization with per-channel values (for RGB).
+    pub fn imagenet_rgb() -> (Self, Self, Self) {
+        (
+            Self::new(0.485, 0.229),
+            Self::new(0.456, 0.224),
+            Self::new(0.406, 0.225),
+        )
     }
 }
 
@@ -106,9 +119,10 @@ impl GaussianNoise {
 
 impl Transform for GaussianNoise {
     fn apply(&self, input: &Tensor) -> Result<Tensor> {
-        // TODO: Implement proper noise addition when randn is available
-        // For now, return input unchanged
-        Ok(input.clone())
+        // Add Gaussian noise: input + N(0, std)
+        let noise = Tensor::randn(input.shape().to_vec(), DType::F32, input.device());
+        let noise_scaled = noise.mul_scalar(self.std)?;
+        input.add(&noise_scaled)
     }
 }
 
@@ -135,9 +149,21 @@ impl ToOneHot {
 
 impl Transform for ToOneHot {
     fn apply(&self, input: &Tensor) -> Result<Tensor> {
-        // TODO: Implement one-hot encoding
-        // For now, return input unchanged
-        Ok(input.clone())
+        // Convert class indices to one-hot vectors
+        let indices = input.to_vec::<i64>()?;
+        let numel = indices.len();
+        let mut output = vec![0.0f32; numel * self.num_classes];
+        
+        for (i, &idx) in indices.iter().enumerate() {
+            let idx = idx as usize;
+            if idx < self.num_classes {
+                output[i * self.num_classes + idx] = 1.0;
+            }
+        }
+        
+        let mut out_shape = input.shape().to_vec();
+        out_shape.push(self.num_classes);
+        Tensor::from_slice(&output, out_shape, input.device())
     }
 }
 

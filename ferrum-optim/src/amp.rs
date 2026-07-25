@@ -177,21 +177,127 @@ impl Default for Autocast {
 }
 
 /// Convert tensor to half precision (FP16).
+///
+/// FP16 format: 1 sign bit, 5 exponent bits, 10 mantissa bits
+/// Range: ±65504, smallest normal: ~6e-8
 pub fn to_half(tensor: &Tensor) -> Result<Tensor> {
-    // In a real implementation, this would convert to actual FP16
-    // For now, we just return a clone (FP32)
-    Ok(tensor.clone())
+    let data = tensor.to_vec::<f32>()?;
+    let fp16_data: Vec<u16> = data.iter().map(|&x| f32_to_f16(x)).collect();
+    
+    // Store as raw bits in a tensor (using F32 but with FP16 values packed)
+    // In a real implementation, we'd have an F16 dtype
+    // For now, we'll store the FP16 values as f32 for compatibility
+    let converted: Vec<f32> = fp16_data.iter().map(|&bits| f16_to_f32(bits)).collect();
+    Tensor::from_slice(&converted, tensor.shape().to_vec(), tensor.device())
 }
 
 /// Convert tensor to bfloat16.
+///
+/// BF16 format: 1 sign bit, 8 exponent bits, 7 mantissa bits
+/// Same range as FP32 but reduced precision
 pub fn to_bfloat16(tensor: &Tensor) -> Result<Tensor> {
-    // In a real implementation, this would convert to BF16
-    Ok(tensor.clone())
+    let data = tensor.to_vec::<f32>()?;
+    let bf16_data: Vec<u16> = data.iter().map(|&x| f32_to_bf16(x)).collect();
+    
+    // Store as BF16 values converted back to f32 for compatibility
+    let converted: Vec<f32> = bf16_data.iter().map(|&bits| bf16_to_f32(bits)).collect();
+    Tensor::from_slice(&converted, tensor.shape().to_vec(), tensor.device())
 }
 
 /// Convert tensor to full precision (FP32).
 pub fn to_float(tensor: &Tensor) -> Result<Tensor> {
     tensor.to_dtype(DType::F32)
+}
+
+/// Convert f32 to f16 (IEEE 754 half-precision).
+fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 16) as u16 & 0x8000;
+    let exp = ((bits >> 23) as i32 - 127 + 15) as u16;
+    let mantissa = (bits >> 13) as u16 & 0x3FF;
+    
+    if exp == 0 {
+        // Zero or denormalized
+        if mantissa == 0 {
+            sign
+        } else {
+            sign | (mantissa >> 1)
+        }
+    } else if exp == 0x1F {
+        // Inf or NaN
+        sign | 0x7C00 | (mantissa >> 1)
+    } else if exp >= 0x1F {
+        // Overflow -> Inf
+        sign | 0x7C00
+    } else if exp == 1 {
+        // Denormalized
+        sign | (mantissa >> 1)
+    } else {
+        sign | (exp << 10) | mantissa
+    }
+}
+
+/// Convert f16 to f32.
+fn f16_to_f32(val: u16) -> f32 {
+    let sign = (val >> 15) as u32 & 1;
+    let exp = ((val >> 10) & 0x1F) as i32;
+    let mantissa = (val & 0x3FF) as u32;
+    
+    if exp == 0 {
+        if mantissa == 0 {
+            f32::from_bits(sign << 31)
+        } else {
+            // Denormalized
+            let mut m = mantissa;
+            let mut e = -14;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3FF;
+            f32::from_bits((sign << 31) | (((e + 127) as u32) << 23) | (m << 13))
+        }
+    } else if exp == 31 {
+        f32::from_bits((sign << 31) | 0x7F800000 | (mantissa << 13))
+    } else {
+        f32::from_bits((sign << 31) | (((exp - 15 + 127) as u32) << 23) | (mantissa << 13))
+    }
+}
+
+/// Convert f32 to bf16 (brain floating point).
+fn f32_to_bf16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 16) as u16 & 0x8000;
+    let exp = ((bits >> 23) as i32 - 127 + 127) as u16;
+    let mantissa = (bits >> 16) as u16 & 0x7F;
+    
+    if exp == 0 {
+        sign | (mantissa >> 1)
+    } else if exp >= 0xFF {
+        // Inf or NaN
+        sign | 0x7F80 | mantissa
+    } else {
+        sign | (exp << 7) | mantissa
+    }
+}
+
+/// Convert bf16 to f32.
+fn bf16_to_f32(val: u16) -> f32 {
+    let sign = (val >> 15) as u32 & 1;
+    let exp = ((val >> 7) & 0xFF) as i32;
+    let mantissa = (val & 0x7F) as u32;
+    
+    if exp == 0 {
+        if mantissa == 0 {
+            f32::from_bits(sign << 31)
+        } else {
+            f32::from_bits((sign << 31) | (mantissa << 16))
+        }
+    } else if exp == 0xFF {
+        f32::from_bits((sign << 31) | 0x7F800000 | (mantissa << 16))
+    } else {
+        f32::from_bits((sign << 31) | (((exp - 127 + 127) as u32) << 23) | (mantissa << 16))
+    }
 }
 
 /// Check if tensor contains inf or nan values.

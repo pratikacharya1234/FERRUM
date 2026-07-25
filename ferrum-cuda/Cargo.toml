@@ -3,9 +3,9 @@ name = "ferrum-cuda"
 version = "1.0.0"
 edition = "2021"
 authors = ["Pratik Acharya <pratik@ferrum.ai>"]
-description = "CUDA backend for FERRUM deep learning framework"
+description = "CUDA GPU backend for FERRUM deep learning framework"
 license = "Apache-2.0"
-repository = "https://github.com/pratikacharya1234/ferrum"
+repository = "https://github.com/pratikacharya1234/FERRUM"
 keywords = ["deep-learning", "cuda", "gpu", "machine-learning"]
 categories = ["science", "mathematics"]
 
@@ -14,13 +14,11 @@ ferrum-core = { path = "../ferrum-core", version = "1.0.0" }
 thiserror = "1.0"
 parking_lot = "0.12"
 once_cell = "1.19"
-
-# Optional CUDA bindings - users need to have CUDA installed
-[target.'cfg(feature = "cuda")'.dependencies]
-# We'll implement a safe wrapper around CUDA Driver API
+libc = "0.2"
+cudarc = { version = "0.19.8", features = ["cuda-12080"], optional = true }
+lazy_static = "1.5.0"
 
 [features]
 default = []
-cuda = []
-# Simulated GPU for testing without actual CUDA hardware
-simulate = []
+# Enable the cudarc-based GPU backend (requires CUDA toolkit at build time)
+cudarc = ["dep:cudarc"]

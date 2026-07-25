@@ -73,7 +73,6 @@ pub use ferrum_ops as ops;
 pub use ferrum_optim as optim;
 pub use ferrum_serialize as serialize;
 
-#[cfg(feature = "cuda")]
 pub use ferrum_cuda as cuda;
 
 /// Prelude module with commonly used types.
@@ -82,24 +81,24 @@ pub use ferrum_cuda as cuda;
 /// use ferrum::prelude::*;
 /// ```
 pub mod prelude {
-    // Core types
+    // Core types — GPU-first by default
     pub use ferrum_core::{DType, Device, FerrumError, Result, Shape, Tensor};
 
     // Autograd - both module and key types
     pub use ferrum_autograd::{backward, GradientTape};
-    
+
     // Autograd operations and traits (for backward)
     pub use ferrum_core::autograd_ops::{AutogradTensor, NoGradGuard, no_grad};
 
     // Neural network layers
     pub use ferrum_nn::{Linear, Module, ReLU, Sequential, Sigmoid, Tanh};
-    
+
     // Additional activations
     pub use ferrum_nn::{GELU, SiLU, Softmax, LogSoftmax, LeakyReLU, ELU};
-    
+
     // Normalization layers
     pub use ferrum_nn::{LayerNorm, BatchNorm1d, Dropout};
-    
+
     // Embedding layer
     pub use ferrum_nn::Embedding;
 
@@ -111,7 +110,7 @@ pub mod prelude {
 
     // Optimizers
     pub use ferrum_optim::{Adam, AdamConfig, Optimizer, SGDConfig, SGD};
-    
+
     // Learning rate schedulers
     pub use ferrum_optim::{
         LRScheduler, StepLR, MultiStepLR, ExponentialLR,
@@ -121,15 +120,22 @@ pub mod prelude {
 
     // Serialization
     pub use ferrum_serialize::{load, save};
-    
+
     // Data loading
     pub use ferrum_data::{DataLoader, Dataset, TensorDataset, Subset, train_test_split};
     pub use ferrum_data::sampler::{RandomSampler, SequentialSampler, DistributedSampler};
-    
+
     // Distributed training
     pub use ferrum_distributed::{
         init_process_group, get_rank, get_world_size, is_main_process, barrier,
         Backend, ProcessGroup, DistributedDataParallel, ReduceOp,
+    };
+
+    // CUDA GPU — always available
+    pub use ferrum_cuda::{
+        CudaDevice, CudaDeviceManager, CudaBuffer, CudaTensor,
+        CudaStream, CudaEvent, MemoryPool, StreamPool,
+        cuda_available, device_count, synchronize,
     };
 }
 

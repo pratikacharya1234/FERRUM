@@ -1,317 +1,106 @@
 # FERRUM Implementation Roadmap
 
-**Current Version**: 1.0.0
-**Status**: Production Ready (Core Features)
+**Status**: Experimental
+**Last Updated**: July 24, 2026
+
+Companion to [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md), which
+defines what "done" claims below actually mean (verified vs merely existing).
 
 ---
 
-## Completed (v1.0.0)
+## Done and Verified
 
-### Core Infrastructure
-- [x] N-dimensional tensor system
-- [x] All data types (F32, F64, I32, I64, U8)
-- [x] Broadcasting and views
-- [x] Device abstraction (CPU, CUDA placeholder)
+### CPU training stack
+- [x] N-dimensional tensor system with broadcasting and views (CPU)
+- [x] DTypes: F32, F64, I32, I64, F16, Bool
+- [x] Tape-based autograd: `add/sub/mul/div` (broadcast-aware), `matmul`,
+      `sum/mean/sum_dim`, `cat`, `pow/exp/log`, `relu/sigmoid/tanh/neg`
+- [x] Gradient accumulation, `no_grad`, gradient checking
+- [x] SGD (momentum/Nesterov/weight decay) and Adam, updating parameters
+      in place through shared storage
+- [x] End-to-end training: XOR at 100% accuracy; CIFAR-10 MLP example
+      (`examples/cifar10.rs`) on real data
+- [x] `Linear` transposed-gradient bug found and fixed (July 2026)
+- [x] Gradient sanity probe (`examples/grad_probe.rs`)
 
-### Autograd
-- [x] Gradient tape with automatic differentiation
-- [x] backward() function
-- [x] no_grad() context
-- [x] Gradient accumulation for reused tensors
-- [x] Gradient checking tests
+### Raw CUDA layer (`ferrum-cuda`, all via dlopen — no compile-time toolkit)
+- [x] CUDA Driver API: init, contexts, alloc, memcpy, memset, sync
+- [x] cuBLAS `cublasGemmEx`: TF32 144–162 TFLOPS, FP16 272 TFLOPS on A100
+- [x] NVRTC-compiled fused element-wise kernels (~30 µs for a 1M-element chain)
+- [x] GPU memory pool (~2850 GB/s alloc+fill on A100)
+- [x] Benchmark suite (`examples/bench`) with PyTorch reference comparisons
 
-### Neural Network Layers
-- [x] Linear (fully connected)
-- [x] Activations: ReLU, Sigmoid, Tanh, GELU, SiLU, LeakyReLU, ELU
-- [x] Softmax, LogSoftmax
-- [x] LayerNorm, BatchNorm1d
-- [x] Dropout
-- [x] Sequential container
-
-### Training
-- [x] SGD optimizer (momentum, weight decay, Nesterov)
-- [x] Adam optimizer
-- [x] Loss functions: MSE, BCE, CrossEntropy, NLL, L1, SmoothL1
-- [x] XOR example with 100% accuracy
-
-### Data Loading
-- [x] Dataset trait
-- [x] TensorDataset
-- [x] DataLoader with batching
-- [x] Samplers: Sequential, Random, Weighted, Subset, Distributed, Batch
-- [x] Transforms: Normalize, Compose
-
-### Distributed (Infrastructure)
-- [x] ProcessGroup
-- [x] Collectives: broadcast, all_reduce, reduce, gather, scatter, barrier
-- [x] DistributedDataParallel wrapper
-
-### Serialization
-- [x] Save/load tensors
-- [x] Model state dict
+### Infrastructure that exists (unit-tested, not battle-tested)
+- [x] Layers: Conv1d/2d, pooling, RNN/LSTM/GRU cells and stacks,
+      MultiHeadAttention, Transformer encoder, LayerNorm/BatchNorm, Embedding
+      — **forward only; trainability undemonstrated**
+- [x] LR schedulers (8), grad scaler / AMP scaffolding
+- [x] DataLoader, samplers, transforms
+- [x] ProcessGroup / DDP scaffolding (local collectives)
+- [x] Safetensors-style serialization — **zero tests**
 
 ---
 
-## Phase 2: CPU Optimization
+## Phase 1: Connect the two halves — GPU op dispatch — **DONE, A100-verified 2026-07-24**
 
-**Priority**: High
-**Estimated Time**: 2-3 weeks
+Implemented via a backend registration hook (`ferrum_core::gpu::GpuBackend`
+trait + `ferrum_cuda::register_gpu_backend()`), avoiding the
+`ferrum-core` → `ferrum-cuda` dependency cycle.
 
-### Goals
-- [ ] Integrate OpenBLAS for fast matrix operations
-- [ ] Optional MKL support
-- [ ] SIMD optimizations for element-wise operations
-- [ ] Benchmark suite
+- [x] Dispatch `Tensor::matmul` to cuBLAS for `Device::Cuda` F32 tensors
+      (cached handle, TF32; transposed views materialized via strided-copy
+      kernel)
+- [x] Dispatch element-wise ops to NVRTC kernels (strided broadcast binary,
+      unary, scalar; in-place optimizer updates)
+- [x] Reductions (`sum`, `mean`, `sum_dim`) on GPU (global + axis kernels)
+- [x] Autograd backward on GPU tensors — verified gradient parity with CPU
+- [x] Real `to_device` (HtoD/DtoH; it previously only relabeled the device
+      field), DtoH `item()`/`to_vec()`, host-generate+upload constructors
+- [x] `examples/gpu_smoke.rs` correctness gate: **28/28 on A100** (also
+      caught and led to the fix of a double-context bug in `CudaDevice::new`)
+- [x] GPU CIFAR-10 training verified (2026-07-25): loss curve matches CPU
+      (1.93 → 1.39; test acc 39.1% vs 39.8%), **0.2 s/epoch vs 33 s CPU
+      (~165×)**. Found+fixed en route: `--use_fast_math` powf NaN on
+      negative bases (Adam grad²)
 
-### Tasks
-1. Add openblas-src dependency with feature flag
-2. Replace naive matmul with BLAS dgemm/sgemm
-3. Implement SIMD for add, mul, exp, etc.
-4. Create benchmark comparing with PyTorch
+Remaining polish (not blockers): F16/F64 dtypes on GPU, multi-GPU context
+handling, fusing the loss chain to cut small-kernel launch overhead.
 
-### Expected Performance
-- 10-100x speedup for large matrix operations
-- Competitive with PyTorch CPU for standard benchmarks
+## Phase 2: `cublasLt` FP16 matmul
 
----
+`cublasGemmEx` measures 272 TFLOPS on A100 4096³; PyTorch's ~312 comes from
+`cublasLt` (workspace + heuristic algorithm search). Estimated 2–3 h of
+careful FFI.
 
-## Phase 3: Real CUDA GPU Support
+- [ ] dlopen `libcublasLt.so`, matmul descriptors, workspace alloc
+- [ ] `cublasLtMatmulAlgoGetHeuristic` + algo cache keyed by shape/dtype
+- [ ] Fall back to `cublasGemmEx` when unavailable
 
-**Priority**: High
-**Estimated Time**: 4-6 weeks
+## Phase 3: CPU matmul that isn't naive
 
-### Goals
-- [ ] Real CUDA kernel execution
-- [ ] cuBLAS integration for matrix operations
-- [ ] Efficient memory management
-- [ ] Multi-GPU support
+- [ ] Wire `ferrum-ops` tiled/parallel/BLAS matmul into `Tensor::matmul`
+- [ ] SIMD element-wise ops where it matters
 
-### Tasks
-1. CUDA FFI bindings using cuda-sys
-2. Implement kernels: add, mul, matmul, reductions
-3. cuBLAS integration for matmul
-4. Unified memory or explicit transfers
-5. Multi-stream execution
+## Phase 4: Make the remaining layers trainable
 
-### Dependencies
-- CUDA Toolkit 11.0+
-- cuBLAS, cuDNN
+- [ ] Backward coverage (with `grad_probe`-style checks) for conv, pooling,
+      recurrent, attention — including the ops they need (`softmax` backward,
+      `transpose` as a tracked op, `expand` tracking or removal)
+- [ ] CIFAR-10 with a small CNN as the acceptance test
 
----
+## Phase 5: Trust the periphery
 
-## Phase 4: Convolutional Layers
-
-**Priority**: High
-**Estimated Time**: 3-4 weeks
-
-### Goals
-- [ ] Conv1d, Conv2d, Conv3d
-- [ ] MaxPool2d, AvgPool2d
-- [ ] Adaptive pooling
-- [ ] Transposed convolution
-
-### Layers to Implement
-```rust
-Conv2d::new(in_channels, out_channels, kernel_size, stride, padding)
-MaxPool2d::new(kernel_size, stride, padding)
-AvgPool2d::new(kernel_size, stride, padding)
-AdaptiveAvgPool2d::new(output_size)
-ConvTranspose2d::new(in_channels, out_channels, kernel_size)
-```
-
-### Tasks
-1. Im2col implementation for CPU
-2. cuDNN integration for GPU
-3. Backward pass for all layers
-4. Benchmarks against PyTorch
+- [ ] Serialization round-trip tests (currently zero)
+- [ ] Real multi-process distributed run (then NCCL)
+- [ ] ONNX export, TensorBoard logging
 
 ---
 
-## Phase 5: Recurrent Layers
+## Explicit non-claims
 
-**Priority**: Medium
-**Estimated Time**: 3-4 weeks
+To keep this document honest:
 
-### Goals
-- [ ] RNN (vanilla)
-- [ ] LSTM
-- [ ] GRU
-- [ ] Bidirectional variants
-
-### Layers to Implement
-```rust
-RNN::new(input_size, hidden_size, num_layers)
-LSTM::new(input_size, hidden_size, num_layers)
-GRU::new(input_size, hidden_size, num_layers)
-```
-
-### Features
-- Batch-first option
-- Bidirectional support
-- Dropout between layers
-- Packed sequences
-
----
-
-## Phase 6: Transformers and Attention
-
-**Priority**: Medium
-**Estimated Time**: 4-6 weeks
-
-### Goals
-- [ ] Multi-head attention
-- [ ] Transformer encoder/decoder
-- [ ] Positional encoding
-- [ ] Flash Attention optimization
-
-### Layers to Implement
-```rust
-MultiheadAttention::new(embed_dim, num_heads)
-TransformerEncoderLayer::new(d_model, nhead, dim_feedforward)
-TransformerDecoderLayer::new(d_model, nhead, dim_feedforward)
-TransformerEncoder::new(encoder_layer, num_layers)
-TransformerDecoder::new(decoder_layer, num_layers)
-PositionalEncoding::new(d_model, max_len)
-```
-
-### Optimizations
-- Flash Attention for memory efficiency
-- KV caching for inference
-
----
-
-## Phase 7: Model Zoo
-
-**Priority**: Low
-**Estimated Time**: Ongoing
-
-### Goals
-- [ ] Pre-trained model loading
-- [ ] Common architectures
-- [ ] Model conversion from PyTorch
-
-### Models to Include
-- ResNet (18, 34, 50, 101, 152)
-- VGG (11, 13, 16, 19)
-- MobileNet
-- BERT, GPT-2
-- ViT (Vision Transformer)
-
-### Infrastructure
-- Weight download utility
-- PyTorch checkpoint converter
-- Hugging Face model compatibility
-
----
-
-## Phase 8: Real Distributed Training (NCCL)
-
-**Priority**: Medium
-**Estimated Time**: 3-4 weeks
-
-### Goals
-- [ ] NCCL backend for GPU collective operations
-- [ ] Multi-node training
-- [ ] Gradient compression
-
-### Tasks
-1. NCCL bindings
-2. Replace simulated collectives with real NCCL calls
-3. MPI integration for multi-node
-4. Ring-AllReduce optimization
-
----
-
-## Phase 9: Mixed Precision Training
-
-**Priority**: Medium
-**Estimated Time**: 2-3 weeks
-
-### Goals
-- [ ] FP16/BF16 tensor support
-- [ ] Automatic mixed precision (AMP)
-- [ ] Loss scaling
-- [ ] Tensor cores utilization
-
-### API
-```rust
-let scaler = GradScaler::new();
-let model = model.half();  // Convert to FP16
-
-// Training loop
-let loss = model.forward(&input.half())?;
-scaler.scale(&loss)?.backward()?;
-scaler.step(&optimizer)?;
-scaler.update();
-```
-
----
-
-## Phase 10: Testing and Benchmarks
-
-**Priority**: Ongoing
-**Estimated Time**: Ongoing
-
-### Goals
-- [ ] Comprehensive unit tests for all operations
-- [ ] Integration tests
-- [ ] Performance benchmarks
-- [ ] CI/CD pipeline
-
-### Benchmarks to Create
-- Tensor operations vs NumPy
-- Neural network layers vs PyTorch
-- Training throughput vs PyTorch
-- Memory usage comparison
-
-### Testing Goals
-- 90%+ code coverage
-- Fuzz testing for edge cases
-- Property-based testing
-
----
-
-## Phase 11: Documentation
-
-**Priority**: Ongoing
-**Estimated Time**: Ongoing
-
-### Goals
-- [x] API Reference
-- [x] Quick Start Guide
-- [ ] Tutorial series
-- [ ] Architecture documentation
-- [ ] Contribution guide improvements
-- [ ] Rustdoc comments for all public APIs
-
-### Tutorials to Write
-1. Building your first neural network
-2. Image classification with Conv2d
-3. Sequence modeling with LSTM
-4. Fine-tuning transformers
-5. Distributed training guide
-6. Custom layer implementation
-
----
-
-## Version Timeline
-
-| Version | Target | Key Features |
-|---------|--------|--------------|
-| v1.0.0 | Done | Core framework, autograd, basic layers |
-| v1.1.0 | Q2 2026 | BLAS optimization, Conv2d |
-| v1.2.0 | Q3 2026 | LSTM/GRU, real CUDA |
-| v1.3.0 | Q4 2026 | Transformers, model zoo |
-| v2.0.0 | 2027 | Production-grade, PyTorch parity |
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute.
-
-Priority areas:
-1. BLAS integration
-2. CUDA kernels
-3. Conv2d implementation
-4. Test coverage
+- No "production ready" claim until Phases 1–4 are done and a non-toy model
+  has trained on GPU with verified accuracy.
+- Version timeline tables removed — dates were fiction. Phases land when
+  they land, in the order above.

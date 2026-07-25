@@ -59,7 +59,7 @@ pub fn main() -> Result<()> {
     println!("─────────────────────────────────────────────────────────────");
 
     for epoch in 1..=num_epochs {
-        let loss_val = GradientTape::with_tape(|_tape| {
+        let loss_val = GradientTape::with_tape(|_tape| -> Result<f32> {
             // Set requires_grad for this iteration
             w1.set_requires_grad(true);
             b1.set_requires_grad(true);

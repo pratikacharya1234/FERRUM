@@ -116,8 +116,8 @@ impl CudaTensor {
         &self.device
     }
 
-    /// Get raw pointer to GPU data.
-    pub fn ptr(&self) -> *mut u8 {
+    /// Get raw CUDA device pointer to GPU data.
+    pub fn ptr(&self) -> u64 {
         self.buffer.ptr()
     }
 
@@ -435,23 +435,26 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "simulate")]
     fn test_tensor_creation() {
-        let device = Arc::new(CudaDevice::new(0).unwrap());
-        let tensor = CudaTensor::zeros(device, &[2, 3], 4).unwrap();
-        assert_eq!(tensor.shape(), &[2, 3]);
-        assert_eq!(tensor.numel(), 6);
+        use crate::cuda_device::init_cuda;
+        if init_cuda().is_ok() {
+            let device = Arc::new(CudaDevice::new(0).unwrap());
+            let tensor = CudaTensor::zeros(device, &[2, 3], 4).unwrap();
+            assert_eq!(tensor.shape(), &[2, 3]);
+            assert_eq!(tensor.numel(), 6);
+        }
     }
 
     #[test]
-    #[cfg(feature = "simulate")]
     fn test_tensor_from_host() {
-        let device = Arc::new(CudaDevice::new(0).unwrap());
-        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let tensor = CudaTensor::from_f32(device, &[2, 3], &data).unwrap();
-        
-        let result = tensor.to_f32().unwrap();
-        assert_eq!(result, data);
+        use crate::cuda_device::init_cuda;
+        if init_cuda().is_ok() {
+            let device = Arc::new(CudaDevice::new(0).unwrap());
+            let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let tensor = CudaTensor::from_f32(device, &[2, 3], &data).unwrap();
+            let result = tensor.to_f32().unwrap();
+            assert_eq!(result, data);
+        }
     }
 
     #[test]

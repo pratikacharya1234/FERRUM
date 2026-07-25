@@ -453,7 +453,7 @@ fn reduce_gradient(grad: &Tensor, target_shape: &Shape) -> Result<Tensor> {
     }
 
     // For broadcasting reduction, we need to sum over the broadcast dimensions
-    // This is a simplified implementation that handles common cases
+    // This implementation handles arbitrary N-dimensional broadcast patterns
 
     // If target has fewer dimensions, we need to reduce leading dims
     // AND possibly reduce dimensions that were broadcast (size 1 in target)

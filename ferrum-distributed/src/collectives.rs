@@ -58,14 +58,14 @@ pub trait Collectives {
     fn barrier(&self) -> Result<()>;
 }
 
-/// Simulated collective operations for testing.
+/// Single-process collective operations for testing and single-GPU workflows.
 pub struct SimulatedCollectives {
     rank: usize,
     world_size: usize,
 }
 
 impl SimulatedCollectives {
-    /// Create new simulated collectives.
+    /// Create new single-process collectives.
     pub fn new(rank: usize, world_size: usize) -> Self {
         Self { rank, world_size }
     }
@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simulated_barrier() {
+    fn test_single_process_barrier() {
         let collectives = SimulatedCollectives::new(0, 1);
         assert!(collectives.barrier().is_ok());
     }
